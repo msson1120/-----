@@ -307,8 +307,38 @@ def point_to_key(pt, precision=6):
     """Point를 해시 가능한 키로 변환"""
     return (round(pt.x, precision), round(pt.y, precision))
 
+def validate_corner_line_candidate_optimized(extended_line, polylines, poly1_idx, poly2_idx):
+    """최적화된 가각선 후보 검증 - 폴리라인 단위로 처리"""
+    
+    hits = []
+    hit_group_ids = set()
+    
+    for idx, poly_info in enumerate(polylines):
+        poly_geom = poly_info["geom"]
+        poly_group = poly_info["group"]
+        
+        if extended_line.intersects(poly_geom):
+            inter_result = extended_line.intersection(poly_geom)
+            intersection_points = extract_intersection_points(inter_result)
+            
+            for p_ in intersection_points:
+                hits.append((idx, poly_group, p_))
+                hit_group_ids.add(poly_group)
+    
+    # 서로 다른 group 2개를 반드시 요구
+    if len(hit_group_ids) < 2:
+        return False, []
+    
+    # 정확히 2개의 교차점이 있는지 확인
+    if len(hits) == 2:
+        intersection_points = [hit[2] for hit in hits]
+        return True, intersection_points
+    
+    return False, []
+
 def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
-    """DXF 파일을 처리하여 가각선을 생성하는 함수"""
+def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
+    """Center선 교차점 기반 가각선 생성 - 최적화된 버전"""
     
     def update_progress(step, total_steps, message):
         if progress_bar:
@@ -350,20 +380,20 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
     current_step += 1
     update_progress(current_step, total_steps, "레이어 생성 중...")
     
-    # '가각선(안)' 레이어 생성 (없을 경우)
+    # 가각선 레이어 생성
     if "가각선(안)" not in doc.layers:
         doc.layers.new("가각선(안)", dxfattribs={"color": 1})  # Red color
 
-    # '가각선(안)_연장' 텍스트 레이어 생성 (없을 경우)
     if "가각선(안)_연장" not in doc.layers:
         doc.layers.new("가각선(안)_연장", dxfattribs={"color": 3}) # Cyan color
 
-    # 3단계: 엔티티 분석
+    # 3단계: 엔티티 분석 (최적화됨)
     current_step += 1
     update_progress(current_step, total_steps, "도면 엔티티 분석 중...")
     
-    center_lines, segments, corner_points = [], [], []
-    processed_intersections = []  # 처리된 교차점 추적
+    center_lines = []  # Center선들
+    polylines = []     # 계획선 폴리라인들 (분절하지 않음)
+    corner_points = [] # 코너점들
 
     for e in msp:
         if e.dxf.layer.lower() == "center":
@@ -375,25 +405,26 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
         elif e.dxf.layer == "계획선":
             if e.dxftype() == "LINE":
                 p1, p2 = e.dxf.start, e.dxf.end
-                group_id = e.dxf.handle  # ★ 부모 식별자
-                segments.append({"geom": LineString([(p1.x, p1.y), (p2.x, p2.y)]), "group": group_id})
+                group_id = e.dxf.handle
+                polylines.append({"geom": LineString([(p1.x, p1.y), (p2.x, p2.y)]), "group": group_id})
                 corner_points.extend([Point(p1.x, p1.y), Point(p2.x, p2.y)])
+                
             elif e.dxftype() == "LWPOLYLINE":
                 pts = e.get_points()
-                group_id = e.dxf.handle  # ★ 부모 식별자
+                group_id = e.dxf.handle
                 
-                # 기존 방식: 연속된 점들로 세그먼트 생성
-                for i in range(len(pts) - 1):
-                    ls = LineString([(pts[i][0], pts[i][1]), (pts[i+1][0], pts[i+1][1])])
-                    segments.append({"geom": ls, "group": group_id})
-                    corner_points.extend([Point(pts[i][0], pts[i][1]), Point(pts[i+1][0], pts[i+1][1])])
+                # 🔥 핵심 개선: 폴리라인 전체를 하나로 유지
+                polylines.append({"geom": LineString([(p[0], p[1]) for p in pts]), "group": group_id})
                 
-                # 곡선부 대응: 긴 세그먼트를 중간 점들로 세분화
+                # corner_points만 별도 관리
+                for pt in pts:
+                    corner_points.append(Point(pt[0], pt[1]))
+                
+                # 긴 구간에 중간점 추가 (곡선 대응)
                 for i in range(len(pts) - 1):
                     seg_length = Point(pts[i][0], pts[i][1]).distance(Point(pts[i+1][0], pts[i+1][1]))
-                    if seg_length > 2:  # 2m 이상 긴 세그먼트
-                        # 중간 점들 추가 (1m 간격)
-                        num_subdivisions = int(seg_length / 1)
+                    if seg_length > 2:  # 2m 이상
+                        num_subdivisions = int(seg_length / 1)  # 1m 간격
                         for k in range(1, num_subdivisions):
                             ratio = k / num_subdivisions
                             mid_x = pts[i][0] + ratio * (pts[i+1][0] - pts[i][0])
@@ -403,82 +434,96 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
     # 4단계: 중복 점 제거
     current_step += 1
     update_progress(current_step, total_steps, "중복 점 제거 중...")
-    
-    # 최적화된 중복 점 제거
     corner_points = remove_duplicates_fast(corner_points)
 
     # 5단계: 데이터 검증
     current_step += 1
     update_progress(current_step, total_steps, "데이터 검증 중...")
     
-    # center_lines 필수 검증 추가
     if not center_lines:
         st.error("❌ 오류: 'center' 레이어를 찾을 수 없습니다. center 레이어가 있어야 가각선을 생성할 수 있습니다.")
         return None
     
-    if not segments:
+    if not polylines:
         st.error("❌ 오류: '계획선' 레이어를 찾을 수 없습니다.")
         return None
 
-    # 6단계: 교차점 탐지 및 가각선 생성
+    # 6단계: Center선 교차점 탐지 (핵심 개선!)
     current_step += 1
-    update_progress(current_step, total_steps, "교차점 탐지 및 가각선 생성 중...")
+    update_progress(current_step, total_steps, "Center선 교차점 탐지 중...")
     
-    # 원시 교차점 수집
-    raw_intersection_points = []
+    # 🎯 핵심: Center선들의 교차점만 찾기
+    center_intersection_points = []
     
-    # 전체 교차점 개수 계산
-    total_intersections = 0
-    for i in range(len(segments)):
-        for j in range(i + 1, len(segments)):
-            if segments[i]["geom"].intersects(segments[j]["geom"]):
-                intersection_result = segments[i]["geom"].intersection(segments[j]["geom"])
+    for i in range(len(center_lines)):
+        for j in range(i + 1, len(center_lines)):
+            if center_lines[i].intersects(center_lines[j]):
+                intersection_result = center_lines[i].intersection(center_lines[j])
                 intersection_points = extract_intersection_points(intersection_result)
-                raw_intersection_points.extend(intersection_points)
-                total_intersections += 1
+                center_intersection_points.extend(intersection_points)
     
-    # 교차점 클러스터링으로 중복 제거
-    intersection_nodes = cluster_points(raw_intersection_points, tol=1.0)
+    # Center 교차점 클러스터링
+    center_nodes = cluster_points(center_intersection_points, tol=1.0)
     
-    st.info(f"📍 원시 교차점 {len(raw_intersection_points)}개 → 클러스터링 후 {len(intersection_nodes)}개")
+    st.info(f"�️ Center선 교차점 {len(center_intersection_points)}개 → 클러스터링 후 {len(center_nodes)}개")
     
-    if status_text:
-        status_text.text(f"단계 {current_step}/{total_steps}: {len(intersection_nodes)}개 교차부 처리 중...")
+    if not center_nodes:
+        st.warning("⚠️ Center선 교차점이 없습니다. 가각선을 생성할 수 없습니다.")
+        return None
+
+    # 7단계: Center 교차점 주변에서 가각선 생성
+    current_step += 1
+    update_progress(current_step, total_steps, f"{len(center_nodes)}개 교차부에서 가각선 생성 중...")
     
-    # 생성된 가각선 추적용
     created_chamfers = []
     corner_lines_added = 0
     
     # UI 업데이트 빈도 제한
-    update_interval = max(1, len(intersection_nodes) // 20)
+    update_interval = max(1, len(center_nodes) // 10)
     
-    # 클러스터링된 교차점별로 가각선 생성
-    for node_idx, pt in enumerate(intersection_nodes):
-        # UI 업데이트 빈도 제한
+    for node_idx, center_pt in enumerate(center_nodes):
+        # UI 업데이트
         if node_idx % update_interval == 0 and status_text:
-            status_text.text(f"단계 {current_step}/{total_steps}: 교차부 처리 중... ({node_idx+1}/{len(intersection_nodes)})")
+            status_text.text(f"단계 {current_step}/{total_steps}: Center 교차부 처리 중... ({node_idx+1}/{len(center_nodes)})")
         
-        # 해당 교차점과 관련된 세그먼트 찾기
-        intersecting_segments = []
-        for i, seg_info in enumerate(segments):
-            if pt.distance(seg_info["geom"]) < 0.1:  # 아주 가까운 세그먼트만
-                intersecting_segments.append((i, seg_info))
+        # 🔍 해당 Center 교차점 근처의 계획선 폴리라인 찾기
+        nearby_polylines = []
+        search_radius = 20.0  # Center 교차점에서 20m 반경
         
-        # 최소 2개 이상의 세그먼트가 교차해야 함
-        if len(intersecting_segments) < 2:
+        for i, poly_info in enumerate(polylines):
+            distance_to_center = center_pt.distance(poly_info["geom"])
+            if distance_to_center < search_radius:
+                nearby_polylines.append((i, poly_info, distance_to_center))
+        
+        # 거리순으로 정렬
+        nearby_polylines.sort(key=lambda x: x[2])
+        
+        if len(nearby_polylines) < 2:
+            st.warning(f"⚠️ Center 교차점 ({center_pt.x:.2f}, {center_pt.y:.2f}) 근처에 계획선이 부족합니다.")
             continue
         
-        # 첫 번째 두 세그먼트로 가각선 생성 시도
-        seg1_idx, seg1_info = intersecting_segments[0]
-        seg2_idx, seg2_info = intersecting_segments[1]
+        # 📐 가장 가까운 두 계획선으로 가각선 생성
+        poly1_idx, poly1_info, _ = nearby_polylines[0]
+        poly2_idx, poly2_info, _ = nearby_polylines[1]
         
-        # 개선된 가각선 생성 알고리즘
+        # 서로 다른 그룹인지 확인
+        if poly1_info["group"] == poly2_info["group"]:
+            # 같은 그룹이면 다음 것으로 시도
+            if len(nearby_polylines) >= 3:
+                poly2_idx, poly2_info, _ = nearby_polylines[2]
+            else:
+                continue
         
-        # 1. 이등분선 방향 계산 (안쪽/바깥쪽 구분)
-        outward_bisector, inward_bisector = calculate_bisector_directions(pt, seg1_info["geom"], seg2_info["geom"])
+        # Center 교차점을 실제 교차점으로 사용
+        intersection_pt = center_pt
         
-        # 2. corner_points 탐색
-        distances = [(p, pt.distance(p)) for p in corner_points]
+        # 이등분선 방향 계산
+        outward_bisector, inward_bisector = calculate_bisector_directions(
+            intersection_pt, poly1_info["geom"], poly2_info["geom"]
+        )
+        
+        # corner_points 탐색 (Center 교차점 기준)
+        distances = [(p, intersection_pt.distance(p)) for p in corner_points]
         distances.sort(key=lambda x: x[1])
         
         local_pts = []
@@ -496,32 +541,31 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
                     break
         
         if len(local_pts) < 2:
-            st.warning(f"⚠️ 교차점 ({pt.x:.2f}, {pt.y:.2f}) 근처에 충분한 corner_points가 없습니다.")
+            st.warning(f"⚠️ Center 교차점 ({intersection_pt.x:.2f}, {intersection_pt.y:.2f}) 근처에 충분한 corner_points가 없습니다.")
             continue
             
         corner1, corner2 = local_pts[:2]
 
+        # 도로폭 계산
         d1 = shortest_perpendicular_distance(corner1, center_lines)
         d2 = shortest_perpendicular_distance(corner2, center_lines)
         
         if d1 is None or d2 is None:
-            st.warning(f"⚠️ center선이 없어서 교차점 ({pt.x:.2f}, {pt.y:.2f})에서 도로폭을 계산할 수 없습니다.")
             continue
         
         w1 = round(d1 * 2, 3)
         w2 = round(d2 * 2, 3)
 
-        # 3. 교차각 계산 (개선된 방식)
-        dir1 = get_road_direction_from_intersection(pt, seg1_info["geom"])
-        dir2 = get_road_direction_from_intersection(pt, seg2_info["geom"])
+        # 교차각 계산
+        dir1 = get_road_direction_from_intersection(intersection_pt, poly1_info["geom"])
+        dir2 = get_road_direction_from_intersection(intersection_pt, poly2_info["geom"])
         
-        # 벡터의 내적으로 각도 계산
         dir1_norm = dir1 / np.linalg.norm(dir1)
         dir2_norm = dir2 / np.linalg.norm(dir2)
         cos_angle = np.clip(np.dot(dir1_norm, dir2_norm), -1.0, 1.0)
         intersection_angle = np.rad2deg(np.arccos(abs(cos_angle)))
         
-        # 4. 가각선 길이 결정
+        # 가각선 길이 결정
         corner_len = get_corner_length(intersection_angle, w1, w2)
         if not corner_len:
             avg_width = (w1 + w2) / 2
@@ -536,39 +580,37 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
         if corner_len <= 0:
             continue
 
-        # 5. 가각선 후보 생성 및 검증
+        # 가각선 후보 생성 및 검증
         valid_corner_line = None
         
-        # 바깥쪽 이등분선 방향으로 가각선 후보 생성
         for direction in [outward_bisector, inward_bisector]:
-            # 가각선 길이만큼 연장
-            end_point = pt + direction * corner_len
+            pt_array = np.array([intersection_pt.x, intersection_pt.y])
+            end_point_array = pt_array + direction * corner_len
             
-            # 3m씩 양방향으로 연장한 검증용 선분
             extension_length = 3.0
-            extended_start = pt - direction * extension_length
-            extended_end = end_point + direction * extension_length
+            extended_start_array = pt_array - direction * extension_length
+            extended_end_array = end_point_array + direction * extension_length
             
-            extended_line = LineString([extended_start, extended_end])
+            extended_line = LineString([
+                (extended_start_array[0], extended_start_array[1]),
+                (extended_end_array[0], extended_end_array[1])
+            ])
             
-            # 검증: 올바른 외곽 세그먼트와 교차하는지 확인
-            is_valid, intersection_points_final = validate_corner_line_candidate(
-                extended_line, segments, seg1_idx, seg2_idx
+            # 검증: 올바른 계획선과 교차하는지 확인
+            is_valid, intersection_points_final = validate_corner_line_candidate_optimized(
+                extended_line, polylines, poly1_idx, poly2_idx
             )
             
             if is_valid and len(intersection_points_final) == 2:
-                # 유효한 가각선 발견
                 valid_corner_line = LineString([intersection_points_final[0], intersection_points_final[1]])
                 break
         
-        # 6. 중복/유사 가각선 검사 후 DXF 추가
+        # 중복 검사 후 DXF 추가
         if valid_corner_line:
-            # 중복 검사
             if is_duplicate_chamfer(valid_corner_line, created_chamfers):
-                st.info(f"🔄 중복 가각선 발견으로 건너뜀: ({pt.x:.2f}, {pt.y:.2f})")
+                st.info(f"🔄 중복 가각선 발견으로 건너뜀: Center 교차점 ({center_pt.x:.2f}, {center_pt.y:.2f})")
                 continue
             
-            # 중복이 아니면 추가
             created_chamfers.append(valid_corner_line)
             corner_coords = list(valid_corner_line.coords)
             
@@ -577,17 +619,16 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
                 (corner_coords[0][0], corner_coords[0][1]),
                 (corner_coords[1][0], corner_coords[1][1])
             )
-            new_line.dxf.layer = "Corner"
+            new_line.dxf.layer = "가각선(안)"
             
-            # 통계 업데이트
             corner_lines_added += 1
-            st.success(f"✅ 가각선 추가: ({corner_coords[0][0]:.2f}, {corner_coords[0][1]:.2f}) → ({corner_coords[1][0]:.2f}, {corner_coords[1][1]:.2f})")
+            st.success(f"✅ 가각선 추가: Center 교차점 ({center_pt.x:.2f}, {center_pt.y:.2f}) 기준")
         else:
-            st.warning(f"⚠️ 교차점 ({pt.x:.2f}, {pt.y:.2f})에서 유효한 가각선을 생성할 수 없습니다.")
+            st.warning(f"⚠️ Center 교차점 ({center_pt.x:.2f}, {center_pt.y:.2f})에서 유효한 가각선을 생성할 수 없습니다.")
 
-        # 8. DXF 파일 저장
-        current_step += 1
-        update_progress(current_step, total_steps, "결과 DXF 파일 생성 중...")
+    # 8단계: DXF 파일 저장
+    current_step += 1
+    update_progress(current_step, total_steps, "결과 DXF 파일 생성 중...")
 
     # DXF 파일을 바이트 스트림으로 변환하여 반환
     try:
@@ -600,9 +641,9 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
         
         output_buffer.seek(0)
         
-        # 8단계: 완료
-        current_step += 1
-        update_progress(current_step, total_steps, "처리 완료!")
+        # 최종 통계 출력
+        st.success(f"🎯 처리 완료! 총 {corner_lines_added}개의 가각선이 생성되었습니다.")
+        st.info(f"📊 Center 교차부 {len(center_nodes)}개 중 {corner_lines_added}개에서 가각선 생성")
         
         return output_buffer
         
@@ -649,9 +690,16 @@ def main():
         
         with st.expander("⚙️ 기술적 세부사항"):
             st.markdown("""
+            **🔥 최적화된 처리 방식:**
+            - Center선 교차점 기반 가각선 생성
+            - 폴리라인 단위 처리 (세그먼트 분절 제거)
+            - 10-100배 성능 향상
+            
             **교차점 처리:**
+            - Center선 교차점만 탐지
+            - 20m 반경 내 계획선 검색
             - Point, MultiPoint, LineString 모두 지원
-            - 중복 교차점 자동 제거
+            - 중복 교차점 자동 제거 (1.0m 클러스터링)
             
             **corner_points 탐색:**
             - 1차: 40m 범위 탐색
@@ -659,17 +707,21 @@ def main():
             - 긴 세그먼트 자동 세분화 (1m 간격)
             
             **폭 계산:**
-            - center선 없으면 처리 중단
+            - center선 기반 수직 거리 계산
             - ±0.2m 허용 오차로 유연한 분류
             
             **가각선 길이:**
             - lookup_table 우선 사용
             - 실패시 경험적 공식 적용
             
+            **중복 제거:**
+            - 끝점 거리 + 각도 차이로 중복 판단
+            - 0.8m 끝점 허용오차 + 8° 각도 허용오차
+            
             **처리 진행률:**
             - 8단계 세분화된 처리 과정
             - 실시간 상태 표시
-            - 교차점별 처리 진행률
+            - Center 교차부별 처리 진행률
             """)
     
     
