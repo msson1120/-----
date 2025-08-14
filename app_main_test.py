@@ -116,8 +116,22 @@ def extract_intersection_points(intersection_result):
     
     return points
 
-def process_dxf_file(uploaded_file):
+def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
     """DXF 파일을 처리하여 가각선을 생성하는 함수"""
+    
+    def update_progress(step, total_steps, message):
+        if progress_bar:
+            progress_bar.progress(step / total_steps)
+        if status_text:
+            status_text.text(f"단계 {step}/{total_steps}: {message}")
+    
+    total_steps = 8
+    current_step = 0
+    
+    # 1단계: 파일 읽기
+    current_step += 1
+    update_progress(current_step, total_steps, "DXF 파일 읽기 중...")
+    
     try:
         # 임시 파일에 업로드된 파일 저장
         with tempfile.NamedTemporaryFile(delete=False, suffix='.dxf') as tmp_file:
@@ -141,6 +155,10 @@ def process_dxf_file(uploaded_file):
         st.error(f"❌ 오류: 파일 처리 중 오류 발생 - {e}")
         return None
 
+    # 2단계: 레이어 생성
+    current_step += 1
+    update_progress(current_step, total_steps, "레이어 생성 중...")
+    
     # '가각선(안)' 레이어 생성 (없을 경우)
     if "가각선(안)" not in doc.layers:
         doc.layers.new("가각선(안)", dxfattribs={"color": 1})  # Red color
@@ -149,6 +167,10 @@ def process_dxf_file(uploaded_file):
     if "가각선(안)_연장" not in doc.layers:
         doc.layers.new("가각선(안)_연장", dxfattribs={"color": 3}) # Cyan color
 
+    # 3단계: 엔티티 분석
+    current_step += 1
+    update_progress(current_step, total_steps, "도면 엔티티 분석 중...")
+    
     center_lines, segments, corner_points = [], [], []
     processed_intersections = []  # 처리된 교차점 추적
 
@@ -183,6 +205,10 @@ def process_dxf_file(uploaded_file):
                             mid_y = pts[i][1] + ratio * (pts[i+1][1] - pts[i][1])
                             corner_points.append(Point(mid_x, mid_y))
 
+    # 4단계: 중복 점 제거
+    current_step += 1
+    update_progress(current_step, total_steps, "중복 점 제거 중...")
+    
     # 중복 점 제거
     unique_corner_points = []
     for pt in corner_points:
@@ -195,6 +221,10 @@ def process_dxf_file(uploaded_file):
             unique_corner_points.append(pt)
     corner_points = unique_corner_points
 
+    # 5단계: 데이터 검증
+    current_step += 1
+    update_progress(current_step, total_steps, "데이터 검증 중...")
+    
     # center_lines 필수 검증 추가
     if not center_lines:
         st.error("❌ 오류: 'center' 레이어를 찾을 수 없습니다. center 레이어가 있어야 가각선을 생성할 수 있습니다.")
@@ -204,10 +234,31 @@ def process_dxf_file(uploaded_file):
         st.error("❌ 오류: '계획선' 레이어를 찾을 수 없습니다.")
         return None
 
+    # 6단계: 교차점 탐지 및 가각선 생성
+    current_step += 1
+    update_progress(current_step, total_steps, "교차점 탐지 및 가각선 생성 중...")
+    
+    total_intersections = 0
+    processed_intersections_count = 0
+    
+    # 전체 교차점 개수 계산
+    for i in range(len(segments)):
+        for j in range(i + 1, len(segments)):
+            if segments[i].intersects(segments[j]):
+                total_intersections += 1
+    
+    if status_text:
+        status_text.text(f"단계 {current_step}/{total_steps}: {total_intersections}개 교차점 처리 중...")
     # 교차점 탐지 및 분석 (개선된 버전)
     for i in range(len(segments)):
         for j in range(i + 1, len(segments)):
             if segments[i].intersects(segments[j]):
+                processed_intersections_count += 1
+                
+                # 교차점 처리 진행률 업데이트
+                if status_text and total_intersections > 0:
+                    status_text.text(f"단계 {current_step}/{total_steps}: 교차점 처리 중... ({processed_intersections_count}/{total_intersections})")
+                
                 intersection_result = segments[i].intersection(segments[j])
                 
                 # 다양한 intersection 결과 처리
@@ -385,6 +436,10 @@ def process_dxf_file(uploaded_file):
                             }
                         )
 
+    # 7단계: 결과 파일 생성
+    current_step += 1
+    update_progress(current_step, total_steps, "결과 DXF 파일 생성 중...")
+
     # DXF 파일을 바이트 스트림으로 변환하여 반환
     try:
         output_buffer = io.BytesIO()
@@ -395,6 +450,11 @@ def process_dxf_file(uploaded_file):
             os.unlink(tmp_file.name)
         
         output_buffer.seek(0)
+        
+        # 8단계: 완료
+        current_step += 1
+        update_progress(current_step, total_steps, "처리 완료!")
+        
         return output_buffer
         
     except Exception as e:
@@ -436,13 +496,6 @@ def main():
         **생성되는 레이어:**
         - `가각선(안)` (가각선)
         - `가각선(안)_연장` (길이 텍스트)
-        
-        **🔧 개선된 기능:**
-        - ✅ 곡선부 교차점 처리
-        - ✅ 확장된 탐색 범위 (40m)
-        - ✅ 유연한 폭 분류 (±0.2m)
-        - ✅ center선 필수 검증
-        - ✅ 경험적 가각선 계산
         """)
         
         with st.expander("⚙️ 기술적 세부사항"):
@@ -463,6 +516,11 @@ def main():
             **가각선 길이:**
             - lookup_table 우선 사용
             - 실패시 경험적 공식 적용
+            
+            **처리 진행률:**
+            - 8단계 세분화된 처리 과정
+            - 실시간 상태 표시
+            - 교차점별 처리 진행률
             """)
     
     
@@ -486,31 +544,44 @@ def main():
         
         # 처리 버튼
         if st.button("🚀 가각선 생성 시작", type="primary"):
-            with st.spinner("DXF 파일을 처리하는 중... 잠시만 기다려주세요."):
-                try:
-                    # DXF 파일 처리
-                    result_buffer = process_dxf_file(uploaded_file)
+            # 프로그레스 바와 상태 텍스트 생성
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            try:
+                # DXF 파일 처리 (프로그레스 바 포함)
+                result_buffer = process_dxf_file(uploaded_file, progress_bar, status_text)
+                
+                if result_buffer:
+                    st.success("✅ 가각선 생성이 완료되었습니다!")
                     
-                    if result_buffer:
-                        st.success("✅ 가각선 생성이 완료되었습니다!")
-                        
-                        # 다운로드 버튼
-                        st.download_button(
-                            label="📥 결과 파일 다운로드",
-                            data=result_buffer.getvalue(),
-                            file_name="가각_결과.dxf",
-                            mime="application/octet-stream",
-                            type="primary"
-                        )
-                        
-                        # 성공 메시지
-                        st.balloons()
-                        
-                    else:
-                        st.error("❌ 파일 처리 중 오류가 발생했습니다.")
-                        
-                except Exception as e:
-                    st.error(f"❌ 처리 중 오류 발생: {str(e)}")
+                    # 프로그레스 바와 상태 텍스트 제거
+                    progress_bar.empty()
+                    status_text.empty()
+                    
+                    # 다운로드 버튼
+                    st.download_button(
+                        label="📥 결과 파일 다운로드",
+                        data=result_buffer.getvalue(),
+                        file_name="가각_결과.dxf",
+                        mime="application/octet-stream",
+                        type="primary"
+                    )
+                    
+                    # 성공 메시지
+                    st.balloons()
+                    
+                else:
+                    # 프로그레스 바와 상태 텍스트 제거
+                    progress_bar.empty()
+                    status_text.empty()
+                    st.error("❌ 파일 처리 중 오류가 발생했습니다.")
+                    
+            except Exception as e:
+                # 프로그레스 바와 상태 텍스트 제거
+                progress_bar.empty()
+                status_text.empty()
+                st.error(f"❌ 처리 중 오류 발생: {str(e)}")
     
     else:
         st.info("👆 DXF 파일을 업로드해주세요.")
