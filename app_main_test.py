@@ -36,13 +36,12 @@ width_classes = [
 ]
 
 def get_width_class(w):
-    # 유연한 폭 분류 (±0.2m 여유)
-    tolerance = 0.2
+    # 유연한 폭 분류 (±0.5m 여유로 확대)
+    tolerance = 0.5
     
-    if math.isclose(w, 4.0, abs_tol=tolerance) or w < 4.0 + tolerance:
-        return "4m미만"
-    elif 4.0 - tolerance <= w < 6.0 + tolerance:
-        return "4m이상6m미만"
+    # 표준 도로폭 분류에 맞춤
+    if w < 6.0 + tolerance:
+        return "6m이상8m미만"  # 소로용
     elif 6.0 - tolerance <= w < 8.0 + tolerance:
         return "6m이상8m미만"
     elif 8.0 - tolerance <= w < 10.0 + tolerance:
@@ -51,8 +50,19 @@ def get_width_class(w):
         return "10m이상12m미만"
     elif 12.0 - tolerance <= w < 15.0 + tolerance:
         return "12m이상15m미만"
-    elif w >= 15.0 - tolerance:
-        return "15m이상"
+    elif 15.0 - tolerance <= w < 20.0 + tolerance:
+        return "15m이상20m미만"
+    elif 20.0 - tolerance <= w < 25.0 + tolerance:
+        return "20m이상25m미만"
+    elif 25.0 - tolerance <= w < 30.0 + tolerance:
+        return "25m이상30m미만"
+    elif 30.0 - tolerance <= w < 35.0 + tolerance:
+        return "30m이상35m미만"
+    elif 35.0 - tolerance <= w < 40.0 + tolerance:
+        return "35m이상40m미만"
+    else:
+        return "40m이상"
+    
     return None
 
 def get_angle_class(degree):
@@ -65,17 +75,28 @@ def get_corner_length(angle_deg, w1, w2):
     ac = get_angle_class(angle_deg)
     wc1 = get_width_class(w1)
     wc2 = get_width_class(w2)
+    
+    # 디버깅 정보 출력
+    st.info(f"🔍 분류 결과 - 각도: {angle_deg:.1f}° → {ac}, 폭1: {w1:.2f}m → {wc1}, 폭2: {w2:.2f}m → {wc2}")
+    
     if ac and wc1 and wc2:
         try:
             lookup_table = st.session_state.lookup_table
             if lookup_table:
-                return lookup_table.get((ac, wc1, wc2)) or lookup_table.get((ac, wc2, wc1))
+                result = lookup_table.get((ac, wc1, wc2)) or lookup_table.get((ac, wc2, wc1))
+                if result:
+                    st.info(f"✅ lookup_table에서 찾음: ({ac}, {wc1}, {wc2}) → {result}m")
+                else:
+                    st.warning(f"⚠️ lookup_table에서 조합을 찾지 못함: ({ac}, {wc1}, {wc2})")
+                return result
             else:
                 st.warning(f"⚠️ 경고: lookup_table이 로드되지 않았습니다.")
                 return None
         except (KeyError, AttributeError):
             st.warning(f"⚠️ 경고: lookup_table에서 ({ac}, {wc1}, {wc2}) 조합을 찾을 수 없습니다.")
             return None
+    else:
+        st.warning(f"⚠️ 분류 실패: ac={ac}, wc1={wc1}, wc2={wc2}")
     return None
 
 def get_road_direction_from_intersection(intersection_pt, segment):
@@ -623,19 +644,33 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
         cos_angle = np.clip(np.dot(dir1_norm, dir2_norm), -1.0, 1.0)
         intersection_angle = np.rad2deg(np.arccos(abs(cos_angle)))
         
-        # 가각선 길이 결정
+        # 가각선 길이 결정 (개선된 로직)
         corner_len = get_corner_length(intersection_angle, w1, w2)
+        
+        # 디버깅 정보 출력
+        st.info(f"📏 도로폭: w1={w1:.2f}m, w2={w2:.2f}m, 교차각: {intersection_angle:.1f}°")
+        
         if not corner_len:
+            # 개선된 경험적 공식 (더 긴 가각선)
             avg_width = (w1 + w2) / 2
-            if intersection_angle < 75:
-                corner_len = avg_width * 0.8
+            
+            if intersection_angle < 60:
+                corner_len = max(avg_width * 1.5, 8.0)  # 최소 8m
+            elif intersection_angle < 75:
+                corner_len = max(avg_width * 1.2, 6.0)  # 최소 6m
+            elif intersection_angle > 120:
+                corner_len = max(avg_width * 2.0, 10.0)  # 최소 10m
             elif intersection_angle > 105:
-                corner_len = avg_width * 1.2
-            else:
-                corner_len = avg_width * 1.0
-            st.info(f"📏 경험적 공식으로 가각선 길이 계산: {corner_len:.2f}m")
+                corner_len = max(avg_width * 1.5, 8.0)   # 최소 8m
+            else:  # 75-105도 (직각에 가까움)
+                corner_len = max(avg_width * 1.0, 5.0)   # 최소 5m
+            
+            st.info(f"📏 경험적 공식으로 가각선 길이 계산: {corner_len:.2f}m (기존 lookup_table에서 찾지 못함)")
+        else:
+            st.info(f"📏 lookup_table에서 가각선 길이: {corner_len:.2f}m")
         
         if corner_len <= 0:
+            st.warning(f"⚠️ 가각선 길이가 0 이하입니다: {corner_len}")
             continue
 
         # 가각선 후보 생성 및 검증
@@ -672,6 +707,9 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
             created_chamfers.append(valid_corner_line)
             corner_coords = list(valid_corner_line.coords)
             
+            # 실제 생성된 가각선 길이 계산
+            actual_length = Point(corner_coords[0]).distance(Point(corner_coords[1]))
+            
             # DXF에 가각선 추가
             new_line = doc.modelspace().add_line(
                 (corner_coords[0][0], corner_coords[0][1]),
@@ -680,7 +718,7 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
             new_line.dxf.layer = "가각선(안)"
             
             corner_lines_added += 1
-            st.success(f"✅ 가각선 추가: Center 교차점 ({center_pt.x:.2f}, {center_pt.y:.2f}) 기준")
+            st.success(f"✅ 가각선 추가: Center 교차점 ({center_pt.x:.2f}, {center_pt.y:.2f}) 기준, 실제 길이: {actual_length:.2f}m")
         else:
             st.warning(f"⚠️ Center 교차점 ({center_pt.x:.2f}, {center_pt.y:.2f})에서 유효한 가각선을 생성할 수 없습니다.")
 
