@@ -395,13 +395,17 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
     corner_points = [] # 코너점들
 
     for e in msp:
-        if e.dxf.layer.lower() == "center":
+        layer_name = e.dxf.layer.lower().strip()  # 소문자 변환 및 공백 제거
+        
+        # Center 레이어 검사 (다양한 이름 허용)
+        if layer_name in ["center", "centre", "중심선", "centerline", "center_line"]:
             if e.dxftype() == "LINE":
                 center_lines.append(LineString([(e.dxf.start.x, e.dxf.start.y), (e.dxf.end.x, e.dxf.end.y)]))
             elif e.dxftype() == "LWPOLYLINE":
                 center_lines.append(LineString([(p[0], p[1]) for p in e.get_points()]))
 
-        elif e.dxf.layer == "계획선":
+        # 계획선 레이어 검사 (다양한 이름 허용)
+        elif layer_name in ["계획선", "계획", "plan", "planning", "design", "design_line"]:
             if e.dxftype() == "LINE":
                 p1, p2 = e.dxf.start, e.dxf.end
                 group_id = e.dxf.handle
@@ -439,12 +443,22 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
     current_step += 1
     update_progress(current_step, total_steps, "데이터 검증 중...")
     
+    # 레이어 정보 출력
+    all_layers = set()
+    for e in msp:
+        all_layers.add(e.dxf.layer)
+    
+    st.info(f"📋 DXF 파일의 모든 레이어: {sorted(list(all_layers))}")
+    st.info(f"📐 Center 선 개수: {len(center_lines)}")
+    st.info(f"🛣️ 계획선 폴리라인 개수: {len(polylines)}")
+    st.info(f"📍 Corner 점 개수: {len(corner_points)}")
+    
     if not center_lines:
-        st.error("❌ 오류: 'center' 레이어를 찾을 수 없습니다. center 레이어가 있어야 가각선을 생성할 수 있습니다.")
+        st.error("❌ 오류: center 레이어를 찾을 수 없습니다. 다음 이름 중 하나를 사용해주세요: center, centre, 중심선, centerline, center_line")
         return None
     
     if not polylines:
-        st.error("❌ 오류: '계획선' 레이어를 찾을 수 없습니다.")
+        st.error("❌ 오류: 계획선 레이어를 찾을 수 없습니다. 다음 이름 중 하나를 사용해주세요: 계획선, 계획, plan, planning, design, design_line")
         return None
 
     # 6단계: Center선 교차점 탐지 (핵심 개선!)
@@ -487,7 +501,7 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
         
         # 🔍 해당 Center 교차점 근처의 계획선 폴리라인 찾기
         nearby_polylines = []
-        search_radius = 20.0  # Center 교차점에서 20m 반경
+        search_radius = 50.0  # Center 교차점에서 50m 반경으로 확대
         
         for i, poly_info in enumerate(polylines):
             distance_to_center = center_pt.distance(poly_info["geom"])
@@ -497,24 +511,69 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
         # 거리순으로 정렬
         nearby_polylines.sort(key=lambda x: x[2])
         
+        # 디버깅 정보 출력
+        st.info(f"🔍 Center 교차점 ({center_pt.x:.2f}, {center_pt.y:.2f}) 주변 {search_radius}m 반경에서 계획선 {len(nearby_polylines)}개 발견")
+        
         if len(nearby_polylines) < 2:
-            st.warning(f"⚠️ Center 교차점 ({center_pt.x:.2f}, {center_pt.y:.2f}) 근처에 계획선이 부족합니다.")
-            continue
-        
-        # 📐 가장 가까운 두 계획선으로 가각선 생성
-        poly1_idx, poly1_info, _ = nearby_polylines[0]
-        poly2_idx, poly2_info, _ = nearby_polylines[1]
-        
-        # 서로 다른 그룹인지 확인
-        if poly1_info["group"] == poly2_info["group"]:
-            # 같은 그룹이면 다음 것으로 시도
-            if len(nearby_polylines) >= 3:
-                poly2_idx, poly2_info, _ = nearby_polylines[2]
+            # 더 넓은 범위로 재시도
+            search_radius_extended = 100.0
+            nearby_polylines_extended = []
+            
+            for i, poly_info in enumerate(polylines):
+                distance_to_center = center_pt.distance(poly_info["geom"])
+                if distance_to_center < search_radius_extended:
+                    nearby_polylines_extended.append((i, poly_info, distance_to_center))
+            
+            st.warning(f"⚠️ Center 교차점 ({center_pt.x:.2f}, {center_pt.y:.2f}) 근처 {search_radius}m에 계획선 {len(nearby_polylines)}개 부족. {search_radius_extended}m 확장 시 {len(nearby_polylines_extended)}개 발견")
+            
+            if len(nearby_polylines_extended) >= 2:
+                nearby_polylines = nearby_polylines_extended
+                nearby_polylines.sort(key=lambda x: x[2])
             else:
                 continue
         
-        # Center 교차점을 실제 교차점으로 사용
-        intersection_pt = center_pt
+        # 📐 Center 교차점 근처에서 계획선 교차점 탐지
+        valid_intersection_found = False
+        intersection_pt = None
+        poly1_info = None
+        poly2_info = None
+        
+        # 가능한 모든 계획선 쌍 조합 시도
+        for i in range(len(nearby_polylines)):
+            for j in range(i + 1, len(nearby_polylines)):
+                poly1_idx, poly1_candidate, _ = nearby_polylines[i]
+                poly2_idx, poly2_candidate, _ = nearby_polylines[j]
+                
+                # 서로 다른 그룹인지 확인
+                if poly1_candidate["group"] == poly2_candidate["group"]:
+                    continue
+                
+                # 🎯 핵심: 두 계획선의 실제 교차점 찾기
+                if poly1_candidate["geom"].intersects(poly2_candidate["geom"]):
+                    intersection_result = poly1_candidate["geom"].intersection(poly2_candidate["geom"])
+                    intersection_points = extract_intersection_points(intersection_result)
+                    
+                    if intersection_points:
+                        # Center 교차점과 가장 가까운 계획선 교차점 선택
+                        closest_intersection = min(intersection_points, 
+                                                 key=lambda p: center_pt.distance(p))
+                        
+                        # Center점에서 너무 멀지 않은 교차점만 허용 (50m 이내)
+                        distance_to_center = center_pt.distance(closest_intersection)
+                        if distance_to_center <= 50.0:
+                            intersection_pt = closest_intersection
+                            poly1_info = poly1_candidate
+                            poly2_info = poly2_candidate
+                            valid_intersection_found = True
+                            st.info(f"🎯 계획선 교차점 발견: ({intersection_pt.x:.2f}, {intersection_pt.y:.2f}), Center점에서 거리: {distance_to_center:.2f}m")
+                            break
+                
+                if valid_intersection_found:
+                    break
+        
+        if not valid_intersection_found:
+            st.warning(f"⚠️ Center 교차점 ({center_pt.x:.2f}, {center_pt.y:.2f}) 근처에서 유효한 계획선 교차점을 찾을 수 없습니다.")
+            continue
         
         # 이등분선 방향 계산
         outward_bisector, inward_bisector = calculate_bisector_directions(
