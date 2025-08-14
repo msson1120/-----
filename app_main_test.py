@@ -8,6 +8,7 @@ import io
 import tempfile
 import matplotlib.pyplot as plt
 import math
+from collections import defaultdict
 
 # 세션 상태 초기화
 if 'lookup_table' not in st.session_state:
@@ -116,6 +117,41 @@ def extract_intersection_points(intersection_result):
     
     return points
 
+def remove_duplicates_fast(points, tolerance=1e-6):
+    """공간 인덱싱을 사용한 빠른 중복 점 제거"""
+    grid_size = tolerance * 10
+    grid = defaultdict(list)
+    unique_points = []
+    
+    for pt in points:
+        grid_x = int(pt.x / grid_size)
+        grid_y = int(pt.y / grid_size)
+        grid_key = (grid_x, grid_y)
+        
+        is_duplicate = False
+        # 인근 그리드 셀만 검사
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                neighbor_key = (grid_x + dx, grid_y + dy)
+                for existing_pt in grid[neighbor_key]:
+                    if pt.distance(existing_pt) < tolerance:
+                        is_duplicate = True
+                        break
+                if is_duplicate:
+                    break
+            if is_duplicate:
+                break
+        
+        if not is_duplicate:
+            grid[grid_key].append(pt)
+            unique_points.append(pt)
+    
+    return unique_points
+
+def point_to_key(pt, precision=6):
+    """Point를 해시 가능한 키로 변환"""
+    return (round(pt.x, precision), round(pt.y, precision))
+
 def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
     """DXF 파일을 처리하여 가각선을 생성하는 함수"""
     
@@ -209,17 +245,8 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
     current_step += 1
     update_progress(current_step, total_steps, "중복 점 제거 중...")
     
-    # 중복 점 제거
-    unique_corner_points = []
-    for pt in corner_points:
-        is_duplicate = False
-        for existing_pt in unique_corner_points:
-            if pt.distance(existing_pt) < 1e-6:  # 매우 가까운 점은 중복으로 간주
-                is_duplicate = True
-                break
-        if not is_duplicate:
-            unique_corner_points.append(pt)
-    corner_points = unique_corner_points
+    # 최적화된 중복 점 제거
+    corner_points = remove_duplicates_fast(corner_points)
 
     # 5단계: 데이터 검증
     current_step += 1
@@ -249,14 +276,21 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
     
     if status_text:
         status_text.text(f"단계 {current_step}/{total_steps}: {total_intersections}개 교차점 처리 중...")
-    # 교차점 탐지 및 분석 (개선된 버전)
+    
+    # Set을 사용한 빠른 중복 검사
+    processed_intersections_set = set()
+    
+    # UI 업데이트 빈도 제한
+    update_interval = max(1, total_intersections // 20)  # 최대 20번만 업데이트
+    
+    # 교차점 탐지 및 분석 (최적화된 버전)
     for i in range(len(segments)):
         for j in range(i + 1, len(segments)):
             if segments[i].intersects(segments[j]):
                 processed_intersections_count += 1
                 
-                # 교차점 처리 진행률 업데이트
-                if status_text and total_intersections > 0:
+                # UI 업데이트 빈도 제한
+                if processed_intersections_count % update_interval == 0 and status_text:
                     status_text.text(f"단계 {current_step}/{total_steps}: 교차점 처리 중... ({processed_intersections_count}/{total_intersections})")
                 
                 intersection_result = segments[i].intersection(segments[j])
@@ -265,18 +299,13 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
                 intersection_points = extract_intersection_points(intersection_result)
                 
                 for pt in intersection_points:
-                    # 이미 처리된 교차점인지 확인
-                    is_already_processed = False
-                    for processed_pt in processed_intersections:
-                        if pt.distance(processed_pt) < 1e-6:  # 매우 가까운 점은 같은 점으로 간주
-                            is_already_processed = True
-                            break
+                    pt_key = point_to_key(pt)
                     
-                    if is_already_processed:
+                    # Set을 사용한 빠른 중복 검사
+                    if pt_key in processed_intersections_set:
                         continue
                     
-                    # 현재 교차점을 처리된 목록에 추가
-                    processed_intersections.append(pt)
+                    processed_intersections_set.add(pt_key)
 
                     a1 = direction_from_intersection(pt, segments[i])
                     a2 = direction_from_intersection(pt, segments[j])
@@ -284,20 +313,31 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
                     vy = np.sin(a1) + np.sin(a2)
                     mid_angle = np.arctan2(vy, vx)
 
-                    # 확장된 탐색 범위로 corner_points 찾기
-                    search_radius = 40  # 20 -> 40으로 확장
-                    local_pts = [p for p in corner_points if pt.distance(p) < search_radius]
+                    # 최적화된 corner_points 탐색
+                    # 한 번에 모든 거리 계산 후 정렬
+                    distances = [(p, pt.distance(p)) for p in corner_points]
+                    distances.sort(key=lambda x: x[1])
                     
-                    # corner_points가 부족하면 더 넓은 범위에서 탐색
+                    # 필요한 개수만 선택
+                    local_pts = []
+                    for p, dist in distances:
+                        if dist < 40:  # 첫 번째 범위
+                            local_pts.append(p)
+                        if len(local_pts) >= 2:
+                            break
+                    
+                    # 여전히 부족하면 확장 범위에서 추가
                     if len(local_pts) < 2:
-                        search_radius = 80  # 더 넓은 범위
-                        local_pts = [p for p in corner_points if pt.distance(p) < search_radius]
+                        for p, dist in distances:
+                            if 40 <= dist < 80:  # 확장 범위
+                                local_pts.append(p)
+                            if len(local_pts) >= 2:
+                                break
                     
                     if len(local_pts) < 2:
                         st.warning(f"⚠️ 교차점 ({pt.x:.2f}, {pt.y:.2f}) 근처에 충분한 corner_points가 없습니다. (발견: {len(local_pts)}개)")
                         continue
                         
-                    local_pts.sort(key=lambda p: pt.distance(p))
                     corner1, corner2 = local_pts[:2]
 
                     d1 = shortest_perpendicular_distance(corner1, center_lines)
