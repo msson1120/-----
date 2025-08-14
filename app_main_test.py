@@ -141,9 +141,9 @@ def process_dxf_file(uploaded_file):
         st.error(f"❌ 오류: 파일 처리 중 오류 발생 - {e}")
         return None
 
-    # '가각선(안)_연장' 텍스트 레이어 생성 (없을 경우)
-    if "가각선(안)_연장" not in doc.layers:
-        doc.layers.new("가각선(안)_연장", dxfattribs={"color": 3}) # Cyan color
+    # '가각선(안)' 레이어 생성 (없을 경우)
+    if "가각선(안)" not in doc.layers:
+        doc.layers.new("가각선(안)", dxfattribs={"color": 1})  # Red color
 
     # '가각선(안)_연장' 텍스트 레이어 생성 (없을 경우)
     if "가각선(안)_연장" not in doc.layers:
@@ -195,9 +195,6 @@ def process_dxf_file(uploaded_file):
             unique_corner_points.append(pt)
     corner_points = unique_corner_points
 
-
-    corner_points = unique_corner_points
-
     # center_lines 필수 검증 추가
     if not center_lines:
         st.error("❌ 오류: 'center' 레이어를 찾을 수 없습니다. center 레이어가 있어야 가각선을 생성할 수 있습니다.")
@@ -229,9 +226,6 @@ def process_dxf_file(uploaded_file):
                     
                     # 현재 교차점을 처리된 목록에 추가
                     processed_intersections.append(pt)
-
-                # 현재 교차점을 처리된 목록에 추가
-                processed_intersections.append(pt)
 
                     a1 = direction_from_intersection(pt, segments[i])
                     a2 = direction_from_intersection(pt, segments[j])
@@ -286,110 +280,110 @@ def process_dxf_file(uploaded_file):
                     if corner_len <= 0:
                         continue
 
-                short_len = corner_len / 2 # 가각선 길이의 절반 (중간선 계산용)
-                
-                # 연장할 길이 설정 (3m)
-                extension_length_for_dotted_line = 3 
-
-                offset = short_len * 1  # 평행이동 거리 = 가각선 길이의 1/2
-
-                intersection_points = []
-
-                for sign in [1, -1]:
-                    shift_x = sign * offset * np.cos(mid_angle + np.pi / 2)
-                    shift_y = sign * offset * np.sin(mid_angle + np.pi / 2)
+                    short_len = corner_len / 2 # 가각선 길이의 절반 (중간선 계산용)
                     
-                    # 교차점(pt)에서 mid_angle 방향으로 short_len 만큼 떨어진 지점 (원래 점선 끝점)
-                    original_end_x = pt.x + short_len * np.cos(mid_angle)
-                    original_end_y = pt.y + short_len * np.sin(mid_angle)
+                    # 연장할 길이 설정 (3m)
+                    extension_length_for_dotted_line = 3 
 
-                    # 노란색 점선의 시작점 (평행이동된 교차점)
-                    start_dotted_x = pt.x + shift_x
-                    start_dotted_y = pt.y + shift_y
+                    offset = short_len * 1  # 평행이동 거리 = 가각선 길이의 1/2
 
-                    # 노란색 점선의 끝점 (평행이동된 원래 끝점)
-                    end_dotted_x = original_end_x + shift_x
-                    end_dotted_y = original_end_y + shift_y
+                    intersection_points_final = []
 
-                    # 노란색 점선의 방향 벡터 계산
-                    dx_dotted = end_dotted_x - start_dotted_x
-                    dy_dotted = end_dotted_y - start_dotted_y
-                    
-                    # 길이가 0이 아닌 경우에만 정규화
-                    norm_dotted = np.sqrt(dx_dotted**2 + dy_dotted**2)
-                    if norm_dotted > 1e-6: # 아주 작은 값으로 0 방지
-                        unit_dx_dotted = dx_dotted / norm_dotted
-                        unit_dy_dotted = dy_dotted / norm_dotted
-                    else: # 선분 길이가 0에 가까우면 연장하지 않음
-                        unit_dx_dotted = 0
-                        unit_dy_dotted = 0
+                    for sign in [1, -1]:
+                        shift_x = sign * offset * np.cos(mid_angle + np.pi / 2)
+                        shift_y = sign * offset * np.sin(mid_angle + np.pi / 2)
+                        
+                        # 교차점(pt)에서 mid_angle 방향으로 short_len 만큼 떨어진 지점 (원래 점선 끝점)
+                        original_end_x = pt.x + short_len * np.cos(mid_angle)
+                        original_end_y = pt.y + short_len * np.sin(mid_angle)
 
-                    # 시작점에서 반대 방향으로 3m 연장된 새로운 시작점
-                    extended_start_dotted_x = start_dotted_x - extension_length_for_dotted_line * unit_dx_dotted
-                    extended_start_dotted_y = start_dotted_y - extension_length_for_dotted_line * unit_dy_dotted
+                        # 노란색 점선의 시작점 (평행이동된 교차점)
+                        start_dotted_x = pt.x + shift_x
+                        start_dotted_y = pt.y + shift_y
 
-                    # 끝점에서 같은 방향으로 3m 연장된 새로운 끝점
-                    extended_end_dotted_x = end_dotted_x + extension_length_for_dotted_line * unit_dx_dotted
-                    extended_end_dotted_y = end_dotted_y + extension_length_for_dotted_line * unit_dy_dotted
+                        # 노란색 점선의 끝점 (평행이동된 원래 끝점)
+                        end_dotted_x = original_end_x + shift_x
+                        end_dotted_y = original_end_y + shift_y
 
-                    # 연장된 노란색 점선 생성 (시각화만 제거)
-                    extended_dotted_line = LineString([
-                        (extended_start_dotted_x, extended_start_dotted_y),
-                        (extended_end_dotted_x, extended_end_dotted_y)
-                    ])
+                        # 노란색 점선의 방향 벡터 계산
+                        dx_dotted = end_dotted_x - start_dotted_x
+                        dy_dotted = end_dotted_y - start_dotted_y
+                        
+                        # 길이가 0이 아닌 경우에만 정규화
+                        norm_dotted = np.sqrt(dx_dotted**2 + dy_dotted**2)
+                        if norm_dotted > 1e-6: # 아주 작은 값으로 0 방지
+                            unit_dx_dotted = dx_dotted / norm_dotted
+                            unit_dy_dotted = dy_dotted / norm_dotted
+                        else: # 선분 길이가 0에 가까우면 연장하지 않음
+                            unit_dx_dotted = 0
+                            unit_dy_dotted = 0
 
-                    for seg in segments:
-                        if extended_dotted_line.intersects(seg):
-                            inter_pt = extended_dotted_line.intersection(seg)
-                            if isinstance(inter_pt, Point):
-                                intersection_points.append(inter_pt)
+                        # 시작점에서 반대 방향으로 3m 연장된 새로운 시작점
+                        extended_start_dotted_x = start_dotted_x - extension_length_for_dotted_line * unit_dx_dotted
+                        extended_start_dotted_y = start_dotted_y - extension_length_for_dotted_line * unit_dy_dotted
 
-                if len(intersection_points) == 2:
-                    # 가각선 LineString 생성
-                    final_corner_line = LineString([intersection_points[0], intersection_points[1]])
+                        # 끝점에서 같은 방향으로 3m 연장된 새로운 끝점
+                        extended_end_dotted_x = end_dotted_x + extension_length_for_dotted_line * unit_dx_dotted
+                        extended_end_dotted_y = end_dotted_y + extension_length_for_dotted_line * unit_dy_dotted
 
-                    # 가각선 DXF에 추가
-                    msp.add_line(
-                        (intersection_points[0].x, intersection_points[0].y),
-                        (intersection_points[1].x, intersection_points[1].y),
-                        dxfattribs={"layer": "가각선(안)"}
-                    )
+                        # 연장된 노란색 점선 생성 (시각화만 제거)
+                        extended_dotted_line = LineString([
+                            (extended_start_dotted_x, extended_start_dotted_y),
+                            (extended_end_dotted_x, extended_end_dotted_y)
+                        ])
 
-                    # 텍스트 표기
-                    # 가각선의 길이 계산
-                    corner_line_length = final_corner_line.length
+                        for seg in segments:
+                            if extended_dotted_line.intersects(seg):
+                                inter_pt = extended_dotted_line.intersection(seg)
+                                if isinstance(inter_pt, Point):
+                                    intersection_points_final.append(inter_pt)
 
-                    # 텍스트 내용 정의 (길이만 표기)
-                    text_content = f"길이: {corner_line_length:.2f}m"
+                    if len(intersection_points_final) == 2:
+                        # 가각선 LineString 생성
+                        final_corner_line = LineString([intersection_points_final[0], intersection_points_final[1]])
 
-                    # 텍스트 위치: 가각선의 중간점
-                    mid_point = final_corner_line.interpolate(0.5, normalized=True)
+                        # 가각선 DXF에 추가
+                        msp.add_line(
+                            (intersection_points_final[0].x, intersection_points_final[0].y),
+                            (intersection_points_final[1].x, intersection_points_final[1].y),
+                            dxfattribs={"layer": "가각선(안)"}
+                        )
 
-                    # 텍스트 회전 각도: 가각선의 각도
-                    line_angle_rad = np.arctan2(
-                        final_corner_line.coords[1][1] - final_corner_line.coords[0][1],
-                        final_corner_line.coords[1][0] - final_corner_line.coords[0][0]
-                    )
-                    line_angle_deg = np.degrees(line_angle_rad)
+                        # 텍스트 표기
+                        # 가각선의 길이 계산
+                        corner_line_length = final_corner_line.length
 
-                    # 텍스트가 선과 겹치지 않도록 약간 오프셋 (선에 수직 방향으로)
-                    text_offset_distance = 0.5 # 텍스트가 선에서 떨어질 거리
-                    text_offset_x = text_offset_distance * np.cos(line_angle_rad + np.pi / 2)
-                    text_offset_y = text_offset_distance * np.sin(line_angle_rad + np.pi / 2)
+                        # 텍스트 내용 정의 (길이만 표기)
+                        text_content = f"길이: {corner_line_length:.2f}m"
 
-                    text_insert_point = (mid_point.x + text_offset_x, mid_point.y + text_offset_y)
+                        # 텍스트 위치: 가각선의 중간점
+                        mid_point = final_corner_line.interpolate(0.5, normalized=True)
 
-                    # DXF에 MTEXT 엔티티 추가
-                    msp.add_mtext(
-                        text_content,
-                        dxfattribs={
-                            "layer": "가각선(안)_연장",
-                            "char_height": 0.8,  # 텍스트 높이 (도면 단위)
-                            "rotation": line_angle_deg, # 선분의 각도에 맞춰 회전
-                            "insert": text_insert_point,
-                            "attachment_point": 5 # 5는 Middle Center (중앙에 텍스트가 위치하도록)
-                        }
-                    )
+                        # 텍스트 회전 각도: 가각선의 각도
+                        line_angle_rad = np.arctan2(
+                            final_corner_line.coords[1][1] - final_corner_line.coords[0][1],
+                            final_corner_line.coords[1][0] - final_corner_line.coords[0][0]
+                        )
+                        line_angle_deg = np.degrees(line_angle_rad)
+
+                        # 텍스트가 선과 겹치지 않도록 약간 오프셋 (선에 수직 방향으로)
+                        text_offset_distance = 0.5 # 텍스트가 선에서 떨어질 거리
+                        text_offset_x = text_offset_distance * np.cos(line_angle_rad + np.pi / 2)
+                        text_offset_y = text_offset_distance * np.sin(line_angle_rad + np.pi / 2)
+
+                        text_insert_point = (mid_point.x + text_offset_x, mid_point.y + text_offset_y)
+
+                        # DXF에 MTEXT 엔티티 추가
+                        msp.add_mtext(
+                            text_content,
+                            dxfattribs={
+                                "layer": "가각선(안)_연장",
+                                "char_height": 0.8,  # 텍스트 높이 (도면 단위)
+                                "rotation": line_angle_deg, # 선분의 각도에 맞춰 회전
+                                "insert": text_insert_point,
+                                "attachment_point": 5 # 5는 Middle Center (중앙에 텍스트가 위치하도록)
+                            }
+                        )
 
     # DXF 파일을 바이트 스트림으로 변환하여 반환
     try:
@@ -405,9 +399,6 @@ def process_dxf_file(uploaded_file):
         
     except Exception as e:
         st.error(f"❌ 오류: DXF 파일 처리 오류 - {e}")
-        return None
-
-
         return None
 
 # 스트림릿 메인 인터페이스
