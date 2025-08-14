@@ -78,6 +78,161 @@ def get_corner_length(angle_deg, w1, w2):
             return None
     return None
 
+def get_road_direction_from_intersection(intersection_pt, segment):
+    """교차점에서 도로 세그먼트의 방향을 계산"""
+    from shapely.geometry import Point
+    
+    # 교차점 주변의 세그먼트 방향 분석
+    coords = list(segment.coords)
+    
+    # 교차점과 가장 가까운 좌표 찾기
+    min_dist = float('inf')
+    closest_idx = 0
+    
+    for i, coord in enumerate(coords):
+        dist = Point(coord).distance(intersection_pt)
+        if dist < min_dist:
+            min_dist = dist
+            closest_idx = i
+    
+    # 방향 벡터 계산
+    if closest_idx == 0 and len(coords) > 1:
+        # 시작점이 가장 가까운 경우
+        direction = np.array([coords[1][0] - coords[0][0], coords[1][1] - coords[0][1]])
+    elif closest_idx == len(coords) - 1 and len(coords) > 1:
+        # 끝점이 가장 가까운 경우
+        direction = np.array([coords[-1][0] - coords[-2][0], coords[-1][1] - coords[-2][1]])
+    else:
+        # 중간점인 경우
+        if closest_idx > 0:
+            prev_direction = np.array([coords[closest_idx][0] - coords[closest_idx-1][0], 
+                                     coords[closest_idx][1] - coords[closest_idx-1][1]])
+        else:
+            prev_direction = np.array([0, 0])
+            
+        if closest_idx < len(coords) - 1:
+            next_direction = np.array([coords[closest_idx+1][0] - coords[closest_idx][0], 
+                                     coords[closest_idx+1][1] - coords[closest_idx][1]])
+        else:
+            next_direction = np.array([0, 0])
+            
+        direction = prev_direction + next_direction
+    
+    # 정규화
+    norm = np.linalg.norm(direction)
+    if norm > 1e-6:
+        direction = direction / norm
+    
+    return direction
+
+def calculate_bisector_directions(intersection_pt, segment1, segment2):
+    """교차점에서 두 세그먼트의 이등분선 방향(안쪽/바깥쪽)을 계산"""
+    
+    # 각 세그먼트의 방향 벡터 계산
+    dir1 = get_road_direction_from_intersection(intersection_pt, segment1)
+    dir2 = get_road_direction_from_intersection(intersection_pt, segment2)
+    
+    # 정규화
+    dir1_norm = dir1 / np.linalg.norm(dir1) if np.linalg.norm(dir1) > 1e-6 else dir1
+    dir2_norm = dir2 / np.linalg.norm(dir2) if np.linalg.norm(dir2) > 1e-6 else dir2
+    
+    # 이등분선 계산 (두 가지 방향)
+    bisector1 = dir1_norm + dir2_norm  # 첫 번째 이등분선
+    bisector2 = dir1_norm - dir2_norm  # 수직 이등분선
+    
+    # 정규화
+    if np.linalg.norm(bisector1) > 1e-6:
+        bisector1 = bisector1 / np.linalg.norm(bisector1)
+    if np.linalg.norm(bisector2) > 1e-6:
+        bisector2 = bisector2 / np.linalg.norm(bisector2)
+    
+    # 바깥쪽 방향을 찾기 위해 외적 계산
+    cross_product = np.cross(dir1_norm, dir2_norm)
+    
+    # 바깥쪽과 안쪽 이등분선 구분
+    if cross_product > 0:  # 반시계방향
+        outward_bisector = bisector2
+        inward_bisector = -bisector2
+    else:  # 시계방향
+        outward_bisector = -bisector2  
+        inward_bisector = bisector2
+    
+    return outward_bisector, inward_bisector
+
+def cluster_points(points, tol=1.0):
+    """교차점들을 클러스터링해서 대표점으로 변환"""
+    clusters = []
+    for p in points:
+        assigned = False
+        for c in clusters:
+            if any(p.distance(q) < tol for q in c):
+                c.append(p)
+                assigned = True
+                break
+        if not assigned:
+            clusters.append([p])
+    
+    # 대표점은 중심(centroid) 사용
+    reps = []
+    for cluster in clusters:
+        if len(cluster) == 1:
+            reps.append(cluster[0])
+        else:
+            # MultiPoint의 centroid로 대표점 계산
+            centroid = MultiPoint(cluster).centroid
+            reps.append(centroid)
+    
+    return reps
+
+def line_angle_deg(ls):
+    """선분의 각도 계산 (방향성 제거)"""
+    (x1, y1), (x2, y2) = list(ls.coords)
+    return (math.degrees(math.atan2(y2-y1, x2-x1)) + 360) % 180
+
+def is_duplicate_chamfer(new_line, existing, end_tol=0.8, ang_tol=8.0):
+    """중복/유사 가각선 검출"""
+    a = line_angle_deg(new_line)
+    A0, B0 = Point(new_line.coords[0]), Point(new_line.coords[1])
+    
+    for ln in existing:
+        A1, B1 = Point(ln.coords[0]), Point(ln.coords[1])
+        same_order = A0.distance(A1) < end_tol and B0.distance(B1) < end_tol
+        swap_order = A0.distance(B1) < end_tol and B0.distance(A1) < end_tol
+        
+        if (same_order or swap_order) and abs(a - line_angle_deg(ln)) < ang_tol:
+            return True
+    
+    return False
+
+def validate_corner_line_candidate(extended_line, segments, seg1_idx, seg2_idx):
+    """개선된 가각선 후보 검증 - 서로 다른 group 2개를 반드시 요구"""
+    
+    hits = []
+    hit_group_ids = set()
+    
+    for idx, seg_info in enumerate(segments):
+        seg_geom = seg_info["geom"]
+        seg_group = seg_info["group"]
+        
+        if extended_line.intersects(seg_geom):
+            inter_result = extended_line.intersection(seg_geom)
+            intersection_points = extract_intersection_points(inter_result)
+            
+            for p_ in intersection_points:
+                hits.append((idx, seg_group, p_))
+                hit_group_ids.add(seg_group)
+    
+    # 서로 다른 group 2개를 반드시 요구
+    if len(hit_group_ids) < 2:
+        return False, []  # 같은 폴리라인만 때린 후보는 폐기
+    
+    # 정확히 2개의 교차점이 있는지 확인
+    if len(hits) == 2:
+        intersection_points = [hit[2] for hit in hits]
+        return True, intersection_points
+    
+    return False, []
+
 def direction_from_intersection(inter_point, seg):
     coords = list(seg.coords)
     d0 = inter_point.distance(Point(coords[0]))
@@ -220,13 +375,17 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
         elif e.dxf.layer == "계획선":
             if e.dxftype() == "LINE":
                 p1, p2 = e.dxf.start, e.dxf.end
-                segments.append(LineString([(p1.x, p1.y), (p2.x, p2.y)]))
+                group_id = e.dxf.handle  # ★ 부모 식별자
+                segments.append({"geom": LineString([(p1.x, p1.y), (p2.x, p2.y)]), "group": group_id})
                 corner_points.extend([Point(p1.x, p1.y), Point(p2.x, p2.y)])
             elif e.dxftype() == "LWPOLYLINE":
                 pts = e.get_points()
+                group_id = e.dxf.handle  # ★ 부모 식별자
+                
                 # 기존 방식: 연속된 점들로 세그먼트 생성
                 for i in range(len(pts) - 1):
-                    segments.append(LineString([(pts[i][0], pts[i][1]), (pts[i+1][0], pts[i+1][1])]))
+                    ls = LineString([(pts[i][0], pts[i][1]), (pts[i+1][0], pts[i+1][1])])
+                    segments.append({"geom": ls, "group": group_id})
                     corner_points.extend([Point(pts[i][0], pts[i][1]), Point(pts[i+1][0], pts[i+1][1])])
                 
                 # 곡선부 대응: 긴 세그먼트를 중간 점들로 세분화
@@ -265,220 +424,170 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
     current_step += 1
     update_progress(current_step, total_steps, "교차점 탐지 및 가각선 생성 중...")
     
-    total_intersections = 0
-    processed_intersections_count = 0
+    # 원시 교차점 수집
+    raw_intersection_points = []
     
     # 전체 교차점 개수 계산
+    total_intersections = 0
     for i in range(len(segments)):
         for j in range(i + 1, len(segments)):
-            if segments[i].intersects(segments[j]):
+            if segments[i]["geom"].intersects(segments[j]["geom"]):
+                intersection_result = segments[i]["geom"].intersection(segments[j]["geom"])
+                intersection_points = extract_intersection_points(intersection_result)
+                raw_intersection_points.extend(intersection_points)
                 total_intersections += 1
     
-    if status_text:
-        status_text.text(f"단계 {current_step}/{total_steps}: {total_intersections}개 교차점 처리 중...")
+    # 교차점 클러스터링으로 중복 제거
+    intersection_nodes = cluster_points(raw_intersection_points, tol=1.0)
     
-    # Set을 사용한 빠른 중복 검사
-    processed_intersections_set = set()
+    st.info(f"📍 원시 교차점 {len(raw_intersection_points)}개 → 클러스터링 후 {len(intersection_nodes)}개")
+    
+    if status_text:
+        status_text.text(f"단계 {current_step}/{total_steps}: {len(intersection_nodes)}개 교차부 처리 중...")
+    
+    # 생성된 가각선 추적용
+    created_chamfers = []
+    corner_lines_added = 0
     
     # UI 업데이트 빈도 제한
-    update_interval = max(1, total_intersections // 20)  # 최대 20번만 업데이트
+    update_interval = max(1, len(intersection_nodes) // 20)
     
-    # 교차점 탐지 및 분석 (최적화된 버전)
-    for i in range(len(segments)):
-        for j in range(i + 1, len(segments)):
-            if segments[i].intersects(segments[j]):
-                processed_intersections_count += 1
-                
-                # UI 업데이트 빈도 제한
-                if processed_intersections_count % update_interval == 0 and status_text:
-                    status_text.text(f"단계 {current_step}/{total_steps}: 교차점 처리 중... ({processed_intersections_count}/{total_intersections})")
-                
-                intersection_result = segments[i].intersection(segments[j])
-                
-                # 다양한 intersection 결과 처리
-                intersection_points = extract_intersection_points(intersection_result)
-                
-                for pt in intersection_points:
-                    pt_key = point_to_key(pt)
-                    
-                    # Set을 사용한 빠른 중복 검사
-                    if pt_key in processed_intersections_set:
-                        continue
-                    
-                    processed_intersections_set.add(pt_key)
+    # 클러스터링된 교차점별로 가각선 생성
+    for node_idx, pt in enumerate(intersection_nodes):
+        # UI 업데이트 빈도 제한
+        if node_idx % update_interval == 0 and status_text:
+            status_text.text(f"단계 {current_step}/{total_steps}: 교차부 처리 중... ({node_idx+1}/{len(intersection_nodes)})")
+        
+        # 해당 교차점과 관련된 세그먼트 찾기
+        intersecting_segments = []
+        for i, seg_info in enumerate(segments):
+            if pt.distance(seg_info["geom"]) < 0.1:  # 아주 가까운 세그먼트만
+                intersecting_segments.append((i, seg_info))
+        
+        # 최소 2개 이상의 세그먼트가 교차해야 함
+        if len(intersecting_segments) < 2:
+            continue
+        
+        # 첫 번째 두 세그먼트로 가각선 생성 시도
+        seg1_idx, seg1_info = intersecting_segments[0]
+        seg2_idx, seg2_info = intersecting_segments[1]
+        
+        # 개선된 가각선 생성 알고리즘
+        
+        # 1. 이등분선 방향 계산 (안쪽/바깥쪽 구분)
+        outward_bisector, inward_bisector = calculate_bisector_directions(pt, seg1_info["geom"], seg2_info["geom"])
+        
+        # 2. corner_points 탐색
+        distances = [(p, pt.distance(p)) for p in corner_points]
+        distances.sort(key=lambda x: x[1])
+        
+        local_pts = []
+        for p, dist in distances:
+            if dist < 40:
+                local_pts.append(p)
+            if len(local_pts) >= 2:
+                break
+        
+        if len(local_pts) < 2:
+            for p, dist in distances:
+                if 40 <= dist < 80:
+                    local_pts.append(p)
+                if len(local_pts) >= 2:
+                    break
+        
+        if len(local_pts) < 2:
+            st.warning(f"⚠️ 교차점 ({pt.x:.2f}, {pt.y:.2f}) 근처에 충분한 corner_points가 없습니다.")
+            continue
+            
+        corner1, corner2 = local_pts[:2]
 
-                    a1 = direction_from_intersection(pt, segments[i])
-                    a2 = direction_from_intersection(pt, segments[j])
-                    vx = np.cos(a1) + np.cos(a2)
-                    vy = np.sin(a1) + np.sin(a2)
-                    mid_angle = np.arctan2(vy, vx)
+        d1 = shortest_perpendicular_distance(corner1, center_lines)
+        d2 = shortest_perpendicular_distance(corner2, center_lines)
+        
+        if d1 is None or d2 is None:
+            st.warning(f"⚠️ center선이 없어서 교차점 ({pt.x:.2f}, {pt.y:.2f})에서 도로폭을 계산할 수 없습니다.")
+            continue
+        
+        w1 = round(d1 * 2, 3)
+        w2 = round(d2 * 2, 3)
 
-                    # 최적화된 corner_points 탐색
-                    # 한 번에 모든 거리 계산 후 정렬
-                    distances = [(p, pt.distance(p)) for p in corner_points]
-                    distances.sort(key=lambda x: x[1])
-                    
-                    # 필요한 개수만 선택
-                    local_pts = []
-                    for p, dist in distances:
-                        if dist < 40:  # 첫 번째 범위
-                            local_pts.append(p)
-                        if len(local_pts) >= 2:
-                            break
-                    
-                    # 여전히 부족하면 확장 범위에서 추가
-                    if len(local_pts) < 2:
-                        for p, dist in distances:
-                            if 40 <= dist < 80:  # 확장 범위
-                                local_pts.append(p)
-                            if len(local_pts) >= 2:
-                                break
-                    
-                    if len(local_pts) < 2:
-                        st.warning(f"⚠️ 교차점 ({pt.x:.2f}, {pt.y:.2f}) 근처에 충분한 corner_points가 없습니다. (발견: {len(local_pts)}개)")
-                        continue
-                        
-                    corner1, corner2 = local_pts[:2]
+        # 3. 교차각 계산 (개선된 방식)
+        dir1 = get_road_direction_from_intersection(pt, seg1_info["geom"])
+        dir2 = get_road_direction_from_intersection(pt, seg2_info["geom"])
+        
+        # 벡터의 내적으로 각도 계산
+        dir1_norm = dir1 / np.linalg.norm(dir1)
+        dir2_norm = dir2 / np.linalg.norm(dir2)
+        cos_angle = np.clip(np.dot(dir1_norm, dir2_norm), -1.0, 1.0)
+        intersection_angle = np.rad2deg(np.arccos(abs(cos_angle)))
+        
+        # 4. 가각선 길이 결정
+        corner_len = get_corner_length(intersection_angle, w1, w2)
+        if not corner_len:
+            avg_width = (w1 + w2) / 2
+            if intersection_angle < 75:
+                corner_len = avg_width * 0.8
+            elif intersection_angle > 105:
+                corner_len = avg_width * 1.2
+            else:
+                corner_len = avg_width * 1.0
+            st.info(f"📏 경험적 공식으로 가각선 길이 계산: {corner_len:.2f}m")
+        
+        if corner_len <= 0:
+            continue
 
-                    d1 = shortest_perpendicular_distance(corner1, center_lines)
-                    d2 = shortest_perpendicular_distance(corner2, center_lines)
-                    
-                    # center선이 없어서 도로폭을 계산할 수 없는 경우
-                    if d1 is None or d2 is None:
-                        st.warning(f"⚠️ center선이 없어서 교차점 ({pt.x:.2f}, {pt.y:.2f})에서 도로폭을 계산할 수 없습니다.")
-                        continue
-                    
-                    w1 = round(d1 * 2, 3)
-                    w2 = round(d2 * 2, 3)
+        # 5. 가각선 후보 생성 및 검증
+        valid_corner_line = None
+        
+        # 바깥쪽 이등분선 방향으로 가각선 후보 생성
+        for direction in [outward_bisector, inward_bisector]:
+            # 가각선 길이만큼 연장
+            end_point = pt + direction * corner_len
+            
+            # 3m씩 양방향으로 연장한 검증용 선분
+            extension_length = 3.0
+            extended_start = pt - direction * extension_length
+            extended_end = end_point + direction * extension_length
+            
+            extended_line = LineString([extended_start, extended_end])
+            
+            # 검증: 올바른 외곽 세그먼트와 교차하는지 확인
+            is_valid, intersection_points_final = validate_corner_line_candidate(
+                extended_line, segments, seg1_idx, seg2_idx
+            )
+            
+            if is_valid and len(intersection_points_final) == 2:
+                # 유효한 가각선 발견
+                valid_corner_line = LineString([intersection_points_final[0], intersection_points_final[1]])
+                break
+        
+        # 6. 중복/유사 가각선 검사 후 DXF 추가
+        if valid_corner_line:
+            # 중복 검사
+            if is_duplicate_chamfer(valid_corner_line, created_chamfers):
+                st.info(f"🔄 중복 가각선 발견으로 건너뜀: ({pt.x:.2f}, {pt.y:.2f})")
+                continue
+            
+            # 중복이 아니면 추가
+            created_chamfers.append(valid_corner_line)
+            corner_coords = list(valid_corner_line.coords)
+            
+            # DXF에 가각선 추가
+            new_line = doc.modelspace().add_line(
+                (corner_coords[0][0], corner_coords[0][1]),
+                (corner_coords[1][0], corner_coords[1][1])
+            )
+            new_line.dxf.layer = "Corner"
+            
+            # 통계 업데이트
+            corner_lines_added += 1
+            st.success(f"✅ 가각선 추가: ({corner_coords[0][0]:.2f}, {corner_coords[0][1]:.2f}) → ({corner_coords[1][0]:.2f}, {corner_coords[1][1]:.2f})")
+        else:
+            st.warning(f"⚠️ 교차점 ({pt.x:.2f}, {pt.y:.2f})에서 유효한 가각선을 생성할 수 없습니다.")
 
-                    # 교차각 계산
-                    intersection_angle = abs(np.rad2deg((a2 - a1 + np.pi) % (2*np.pi) - np.pi))
-                    
-                    corner_len = get_corner_length(intersection_angle, w1, w2)
-                    if not corner_len:
-                        # 기본값 사용 (lookup_table에서 찾지 못한 경우)
-                        st.warning(f"⚠️ lookup_table에서 조건을 찾지 못했습니다. 각도: {intersection_angle:.1f}°, 폭: {w1}m, {w2}m")
-                        # 각도와 폭에 따른 경험적 공식 사용
-                        avg_width = (w1 + w2) / 2
-                        if intersection_angle < 75:  # 예각
-                            corner_len = avg_width * 0.8
-                        elif intersection_angle > 105:  # 둔각
-                            corner_len = avg_width * 1.2
-                        else:  # 직각 근처
-                            corner_len = avg_width * 1.0
-                        st.info(f"📏 경험적 공식으로 가각선 길이 계산: {corner_len:.2f}m")
-                    
-                    if corner_len <= 0:
-                        continue
-
-                    short_len = corner_len / 2 # 가각선 길이의 절반 (중간선 계산용)
-                    
-                    # 연장할 길이 설정 (3m)
-                    extension_length_for_dotted_line = 3 
-
-                    offset = short_len * 1  # 평행이동 거리 = 가각선 길이의 1/2
-
-                    intersection_points_final = []
-
-                    for sign in [1, -1]:
-                        shift_x = sign * offset * np.cos(mid_angle + np.pi / 2)
-                        shift_y = sign * offset * np.sin(mid_angle + np.pi / 2)
-                        
-                        # 교차점(pt)에서 mid_angle 방향으로 short_len 만큼 떨어진 지점 (원래 점선 끝점)
-                        original_end_x = pt.x + short_len * np.cos(mid_angle)
-                        original_end_y = pt.y + short_len * np.sin(mid_angle)
-
-                        # 노란색 점선의 시작점 (평행이동된 교차점)
-                        start_dotted_x = pt.x + shift_x
-                        start_dotted_y = pt.y + shift_y
-
-                        # 노란색 점선의 끝점 (평행이동된 원래 끝점)
-                        end_dotted_x = original_end_x + shift_x
-                        end_dotted_y = original_end_y + shift_y
-
-                        # 노란색 점선의 방향 벡터 계산
-                        dx_dotted = end_dotted_x - start_dotted_x
-                        dy_dotted = end_dotted_y - start_dotted_y
-                        
-                        # 길이가 0이 아닌 경우에만 정규화
-                        norm_dotted = np.sqrt(dx_dotted**2 + dy_dotted**2)
-                        if norm_dotted > 1e-6: # 아주 작은 값으로 0 방지
-                            unit_dx_dotted = dx_dotted / norm_dotted
-                            unit_dy_dotted = dy_dotted / norm_dotted
-                        else: # 선분 길이가 0에 가까우면 연장하지 않음
-                            unit_dx_dotted = 0
-                            unit_dy_dotted = 0
-
-                        # 시작점에서 반대 방향으로 3m 연장된 새로운 시작점
-                        extended_start_dotted_x = start_dotted_x - extension_length_for_dotted_line * unit_dx_dotted
-                        extended_start_dotted_y = start_dotted_y - extension_length_for_dotted_line * unit_dy_dotted
-
-                        # 끝점에서 같은 방향으로 3m 연장된 새로운 끝점
-                        extended_end_dotted_x = end_dotted_x + extension_length_for_dotted_line * unit_dx_dotted
-                        extended_end_dotted_y = end_dotted_y + extension_length_for_dotted_line * unit_dy_dotted
-
-                        # 연장된 노란색 점선 생성 (시각화만 제거)
-                        extended_dotted_line = LineString([
-                            (extended_start_dotted_x, extended_start_dotted_y),
-                            (extended_end_dotted_x, extended_end_dotted_y)
-                        ])
-
-                        for seg in segments:
-                            if extended_dotted_line.intersects(seg):
-                                inter_pt = extended_dotted_line.intersection(seg)
-                                if isinstance(inter_pt, Point):
-                                    intersection_points_final.append(inter_pt)
-
-                    if len(intersection_points_final) == 2:
-                        # 가각선 LineString 생성
-                        final_corner_line = LineString([intersection_points_final[0], intersection_points_final[1]])
-
-                        # 가각선 DXF에 추가
-                        msp.add_line(
-                            (intersection_points_final[0].x, intersection_points_final[0].y),
-                            (intersection_points_final[1].x, intersection_points_final[1].y),
-                            dxfattribs={"layer": "가각선(안)"}
-                        )
-
-                        # 텍스트 표기
-                        # 가각선의 길이 계산
-                        corner_line_length = final_corner_line.length
-
-                        # 텍스트 내용 정의 (길이만 표기)
-                        text_content = f"길이: {corner_line_length:.2f}m"
-
-                        # 텍스트 위치: 가각선의 중간점
-                        mid_point = final_corner_line.interpolate(0.5, normalized=True)
-
-                        # 텍스트 회전 각도: 가각선의 각도
-                        line_angle_rad = np.arctan2(
-                            final_corner_line.coords[1][1] - final_corner_line.coords[0][1],
-                            final_corner_line.coords[1][0] - final_corner_line.coords[0][0]
-                        )
-                        line_angle_deg = np.degrees(line_angle_rad)
-
-                        # 텍스트가 선과 겹치지 않도록 약간 오프셋 (선에 수직 방향으로)
-                        text_offset_distance = 0.5 # 텍스트가 선에서 떨어질 거리
-                        text_offset_x = text_offset_distance * np.cos(line_angle_rad + np.pi / 2)
-                        text_offset_y = text_offset_distance * np.sin(line_angle_rad + np.pi / 2)
-
-                        text_insert_point = (mid_point.x + text_offset_x, mid_point.y + text_offset_y)
-
-                        # DXF에 MTEXT 엔티티 추가
-                        msp.add_mtext(
-                            text_content,
-                            dxfattribs={
-                                "layer": "가각선(안)_연장",
-                                "char_height": 0.8,  # 텍스트 높이 (도면 단위)
-                                "rotation": line_angle_deg, # 선분의 각도에 맞춰 회전
-                                "insert": text_insert_point,
-                                "attachment_point": 5 # 5는 Middle Center (중앙에 텍스트가 위치하도록)
-                            }
-                        )
-
-    # 7단계: 결과 파일 생성
-    current_step += 1
-    update_progress(current_step, total_steps, "결과 DXF 파일 생성 중...")
+        # 8. DXF 파일 저장
+        current_step += 1
+        update_progress(current_step, total_steps, "결과 DXF 파일 생성 중...")
 
     # DXF 파일을 바이트 스트림으로 변환하여 반환
     try:
