@@ -673,30 +673,63 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
             st.warning(f"⚠️ 가각선 길이가 0 이하입니다: {corner_len}")
             continue
 
-        # 가각선 후보 생성 및 검증
+        # 가각선 후보 생성 및 검증 (개선된 로직)
         valid_corner_line = None
         
         for direction in [outward_bisector, inward_bisector]:
             pt_array = np.array([intersection_pt.x, intersection_pt.y])
             end_point_array = pt_array + direction * corner_len
             
-            extension_length = 3.0
-            extended_start_array = pt_array - direction * extension_length
-            extended_end_array = end_point_array + direction * extension_length
-            
-            extended_line = LineString([
-                (extended_start_array[0], extended_start_array[1]),
-                (extended_end_array[0], extended_end_array[1])
+            # 🎯 핵심 수정: 계산된 길이대로 직접 가각선 생성 (검증 과정 생략)
+            corner_line_candidate = LineString([
+                (pt_array[0], pt_array[1]),
+                (end_point_array[0], end_point_array[1])
             ])
             
-            # 검증: 올바른 계획선과 교차하는지 확인
-            is_valid, intersection_points_final = validate_corner_line_candidate_optimized(
-                extended_line, polylines, poly1_idx, poly2_idx
-            )
+            # 길이 확인
+            candidate_length = Point(pt_array).distance(Point(end_point_array))
+            st.info(f"🔍 가각선 후보 길이: {candidate_length:.2f}m (목표: {corner_len:.2f}m)")
             
-            if is_valid and len(intersection_points_final) == 2:
-                valid_corner_line = LineString([intersection_points_final[0], intersection_points_final[1]])
+            if candidate_length > 1.0:  # 최소 1m 이상인 경우만 사용
+                valid_corner_line = corner_line_candidate
+                st.info(f"✅ 직접 생성한 가각선 채택: 길이 {candidate_length:.2f}m")
                 break
+            else:
+                st.warning(f"⚠️ 가각선 후보가 너무 짧음: {candidate_length:.2f}m")
+        
+        # 대안: 검증 기반 가각선 생성 (위 방법이 실패할 경우)
+        if not valid_corner_line:
+            st.info("🔄 검증 기반 가각선 생성 시도...")
+            
+            for direction in [outward_bisector, inward_bisector]:
+                pt_array = np.array([intersection_pt.x, intersection_pt.y])
+                end_point_array = pt_array + direction * corner_len
+                
+                extension_length = 3.0
+                extended_start_array = pt_array - direction * extension_length
+                extended_end_array = end_point_array + direction * extension_length
+                
+                extended_line = LineString([
+                    (extended_start_array[0], extended_start_array[1]),
+                    (extended_end_array[0], extended_end_array[1])
+                ])
+                
+                # 검증: 올바른 계획선과 교차하는지 확인
+                is_valid, intersection_points_final = validate_corner_line_candidate_optimized(
+                    extended_line, polylines, poly1_idx, poly2_idx
+                )
+                
+                if is_valid and len(intersection_points_final) == 2:
+                    # 교차점들 사이의 거리 확인
+                    validation_length = intersection_points_final[0].distance(intersection_points_final[1])
+                    st.info(f"🔍 검증된 가각선 길이: {validation_length:.2f}m")
+                    
+                    if validation_length > 1.0:  # 최소 1m 이상
+                        valid_corner_line = LineString([intersection_points_final[0], intersection_points_final[1]])
+                        st.info(f"✅ 검증 기반 가각선 채택: 길이 {validation_length:.2f}m")
+                        break
+                    else:
+                        st.warning(f"⚠️ 검증된 가각선이 너무 짧음: {validation_length:.2f}m")
         
         # 중복 검사 후 DXF 추가
         if valid_corner_line:
