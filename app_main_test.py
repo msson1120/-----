@@ -337,7 +337,6 @@ def validate_corner_line_candidate_optimized(extended_line, polylines, poly1_idx
     return False, []
 
 def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
-def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
     """Center선 교차점 기반 가각선 생성 - 최적화된 버전"""
     
     def update_progress(step, total_steps, message):
