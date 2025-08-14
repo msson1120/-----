@@ -10,6 +10,97 @@ import matplotlib.pyplot as plt
 import math
 from collections import defaultdict
 
+# 새로운 가각선 생성 관련 상수들
+EPS = 0.05           # 접선 추정용(도면 단위)
+NEAR_TOL = 0.30      # '접함' 판정 거리(0.1~0.5 사이 권장)
+OUT_STEP = 0.5       # 바깥/안쪽 판정용 테스트 이동거리
+
+def project_param(ls: LineString, p: Point) -> float:
+    """p를 ls 상의 구간길이 좌표로 사영한 param(0~length)"""
+    return ls.project(p)
+
+def point_at_param(ls: LineString, s: float) -> Point:
+    return ls.interpolate(max(0.0, min(s, ls.length)))
+
+def unit_tangent_at(ls: LineString, s: float) -> np.ndarray:
+    """ls의 길이좌표 s에서의 접선 단위벡터(방향성 유지)"""
+    s0 = max(0.0, s - EPS); s1 = min(ls.length, s + EPS)
+    p0 = point_at_param(ls, s0); p1 = point_at_param(ls, s1)
+    v = np.array([p1.x - p0.x, p1.y - p0.y])
+    n = np.linalg.norm(v)
+    return v / n if n > 1e-9 else np.array([1.0, 0.0])
+
+def pick_outward_dir(base_pt: Point, unit_dir: np.ndarray, center_lines) -> np.ndarray:
+    """unit_dir(±) 중, center까지의 총거리가 증가하는 방향을 '바깥'으로 선택"""
+    def total_dist(q: Point) -> float:
+        return sum(cl.distance(q) for cl in center_lines[:2])  # 가장 영향 큰 2개면 충분
+    p0 = base_pt
+    p_plus  = Point(p0.x + OUT_STEP*unit_dir[0],  p0.y + OUT_STEP*unit_dir[1])
+    p_minus = Point(p0.x - OUT_STEP*unit_dir[0],  p0.y - OUT_STEP*unit_dir[1])
+    return unit_dir if total_dist(p_plus) >= total_dist(p_minus) else -unit_dir
+
+def build_chamfer_on_two_edges(poly1: LineString, poly2: LineString, corner_pt: Point, L: float, center_lines) -> LineString:
+    """
+    corner_pt(두 계획선의 교차/접점)에서 양쪽 계획선으로 L만큼 '바깥'으로 간 점을 잡아
+    그 두 점을 연결한 선을 반환. 불가하면 None.
+    """
+    # 1) corner_pt를 각 폴리라인으로 사영
+    s1 = project_param(poly1, corner_pt)
+    s2 = project_param(poly2, corner_pt)
+
+    # 2) 각 폴리라인의 접선 단위벡터
+    t1 = unit_tangent_at(poly1, s1)
+    t2 = unit_tangent_at(poly2, s2)
+
+    # 3) 바깥 방향 선택(센터로부터 멀어지는 쪽)
+    t1 = pick_outward_dir(corner_pt, t1, center_lines)
+    t2 = pick_outward_dir(corner_pt, t2, center_lines)
+
+    # 4) 폴리라인 길이좌표로 L만큼 전진/후진
+    #    (+)방향이 t벡터와 일치하도록 s±L을 결정
+    #    (사영점에서 미소 전진한 점과 t의 내적 부호로 판단)
+    p1_ahead = point_at_param(poly1, min(poly1.length, s1+EPS))
+    sign1 = np.sign((p1_ahead.x - corner_pt.x)*t1[0] + (p1_ahead.y - corner_pt.y)*t1[1]) or 1.0
+    s1_target = s1 + sign1*L
+    p1 = point_at_param(poly1, s1_target)
+
+    p2_ahead = point_at_param(poly2, min(poly2.length, s2+EPS))
+    sign2 = np.sign((p2_ahead.x - corner_pt.x)*t2[0] + (p2_ahead.y - corner_pt.y)*t2[1]) or 1.0
+    s2_target = s2 + sign2*L
+    p2 = point_at_param(poly2, s2_target)
+
+    # 5) 두 점 사이가 너무 짧으면 무시
+    if p1.distance(p2) < 0.5:  # 필요시 조정
+        return None
+    return LineString([(p1.x, p1.y), (p2.x, p2.y)])
+
+def intersect_or_touch(poly1: LineString, poly2: LineString) -> Point:
+    """
+    교차점이 있으면 그 중 하나(가까운 것)를 반환,
+    없으면 최소거리쌍이 NEAR_TOL 이하일 때 그 '중점'을 corner로 반환.
+    """
+    if poly1.intersects(poly2):
+        inter = poly1.intersection(poly2)
+        pts = extract_intersection_points(inter)
+        if pts: return min(pts, key=lambda q: q.distance(poly1.centroid))  # 임의 기준
+    # 접함(거의 맞닿음) 처리
+    d = poly1.distance(poly2)
+    if d <= NEAR_TOL:
+        # 가장 가까운 점쌍 근사(샘플링)
+        samples = 50
+        best = (1e9, None, None)
+        for k in range(samples+1):
+            s = poly1.length*k/samples
+            q = point_at_param(poly1, s)
+            s2 = project_param(poly2, q)
+            r = point_at_param(poly2, s2)
+            dist = q.distance(r)
+            if dist < best[0]:
+                best = (dist, q, r)
+        if best[1] and best[2]:
+            return Point((best[1].x + best[2].x)/2, (best[1].y + best[2].y)/2)
+    return None
+
 # 세션 상태 초기화
 if 'lookup_table' not in st.session_state:
     st.session_state.lookup_table = None
@@ -505,7 +596,7 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
         st.warning("⚠️ Center선 교차점이 없습니다. 가각선을 생성할 수 없습니다.")
         return None
 
-    # 7단계: Center 교차점 주변에서 가각선 생성
+    # 7단계: Center 교차점 주변에서 가각선 생성 (완전히 새로운 접근법)
     current_step += 1
     update_progress(current_step, total_steps, f"{len(center_nodes)}개 교차부에서 가각선 생성 중...")
     
@@ -520,240 +611,79 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
         if node_idx % update_interval == 0 and status_text:
             status_text.text(f"단계 {current_step}/{total_steps}: Center 교차부 처리 중... ({node_idx+1}/{len(center_nodes)})")
         
-        # 🔍 해당 Center 교차점 근처의 계획선 폴리라인 찾기
-        nearby_polylines = []
-        search_radius = 50.0  # Center 교차점에서 50m 반경으로 확대
+        # Center 인근 계획선 수집
+        nearby = [(i, info, center_pt.distance(info["geom"]))
+                  for i, info in enumerate(polylines)
+                  if center_pt.distance(info["geom"]) < 60.0]
+        nearby.sort(key=lambda x: x[2])
         
-        for i, poly_info in enumerate(polylines):
-            distance_to_center = center_pt.distance(poly_info["geom"])
-            if distance_to_center < search_radius:
-                nearby_polylines.append((i, poly_info, distance_to_center))
+        st.info(f"🔍 Center 교차점 ({center_pt.x:.2f}, {center_pt.y:.2f}) 주변에서 계획선 {len(nearby)}개 발견")
         
-        # 거리순으로 정렬
-        nearby_polylines.sort(key=lambda x: x[2])
-        
-        # 디버깅 정보 출력
-        st.info(f"🔍 Center 교차점 ({center_pt.x:.2f}, {center_pt.y:.2f}) 주변 {search_radius}m 반경에서 계획선 {len(nearby_polylines)}개 발견")
-        
-        if len(nearby_polylines) < 2:
-            # 더 넓은 범위로 재시도
-            search_radius_extended = 100.0
-            nearby_polylines_extended = []
-            
-            for i, poly_info in enumerate(polylines):
-                distance_to_center = center_pt.distance(poly_info["geom"])
-                if distance_to_center < search_radius_extended:
-                    nearby_polylines_extended.append((i, poly_info, distance_to_center))
-            
-            st.warning(f"⚠️ Center 교차점 ({center_pt.x:.2f}, {center_pt.y:.2f}) 근처 {search_radius}m에 계획선 {len(nearby_polylines)}개 부족. {search_radius_extended}m 확장 시 {len(nearby_polylines_extended)}개 발견")
-            
-            if len(nearby_polylines_extended) >= 2:
-                nearby_polylines = nearby_polylines_extended
-                nearby_polylines.sort(key=lambda x: x[2])
-            else:
-                continue
-        
-        # 📐 Center 교차점 근처에서 계획선 교차점 탐지
-        valid_intersection_found = False
-        intersection_pt = None
-        poly1_info = None
-        poly2_info = None
-        
-        # 가능한 모든 계획선 쌍 조합 시도
-        for i in range(len(nearby_polylines)):
-            for j in range(i + 1, len(nearby_polylines)):
-                poly1_idx, poly1_candidate, _ = nearby_polylines[i]
-                poly2_idx, poly2_candidate, _ = nearby_polylines[j]
-                
-                # 서로 다른 그룹인지 확인
-                if poly1_candidate["group"] == poly2_candidate["group"]:
+        # 모든 쌍(서로 다른 group) 순회 — ★ break 금지
+        for a in range(len(nearby)):
+            for b in range(a+1, len(nearby)):
+                i1, poly1_info, _ = nearby[a]
+                i2, poly2_info, _ = nearby[b]
+                if poly1_info["group"] == poly2_info["group"]:
                     continue
-                
-                # 🎯 핵심: 두 계획선의 실제 교차점 찾기
-                if poly1_candidate["geom"].intersects(poly2_candidate["geom"]):
-                    intersection_result = poly1_candidate["geom"].intersection(poly2_candidate["geom"])
-                    intersection_points = extract_intersection_points(intersection_result)
-                    
-                    if intersection_points:
-                        # Center 교차점과 가장 가까운 계획선 교차점 선택
-                        closest_intersection = min(intersection_points, 
-                                                 key=lambda p: center_pt.distance(p))
-                        
-                        # Center점에서 너무 멀지 않은 교차점만 허용 (50m 이내)
-                        distance_to_center = center_pt.distance(closest_intersection)
-                        if distance_to_center <= 50.0:
-                            intersection_pt = closest_intersection
-                            poly1_info = poly1_candidate
-                            poly2_info = poly2_candidate
-                            valid_intersection_found = True
-                            st.info(f"🎯 계획선 교차점 발견: ({intersection_pt.x:.2f}, {intersection_pt.y:.2f}), Center점에서 거리: {distance_to_center:.2f}m")
-                            break
-                
-                if valid_intersection_found:
-                    break
-        
-        if not valid_intersection_found:
-            st.warning(f"⚠️ Center 교차점 ({center_pt.x:.2f}, {center_pt.y:.2f}) 근처에서 유효한 계획선 교차점을 찾을 수 없습니다.")
-            continue
-        
-        # 이등분선 방향 계산
-        outward_bisector, inward_bisector = calculate_bisector_directions(
-            intersection_pt, poly1_info["geom"], poly2_info["geom"]
-        )
-        
-        # corner_points 탐색 (Center 교차점 기준)
-        distances = [(p, intersection_pt.distance(p)) for p in corner_points]
-        distances.sort(key=lambda x: x[1])
-        
-        local_pts = []
-        for p, dist in distances:
-            if dist < 40:
-                local_pts.append(p)
-            if len(local_pts) >= 2:
-                break
-        
-        if len(local_pts) < 2:
-            for p, dist in distances:
-                if 40 <= dist < 80:
-                    local_pts.append(p)
-                if len(local_pts) >= 2:
-                    break
-        
-        if len(local_pts) < 2:
-            st.warning(f"⚠️ Center 교차점 ({intersection_pt.x:.2f}, {intersection_pt.y:.2f}) 근처에 충분한 corner_points가 없습니다.")
-            continue
-            
-        corner1, corner2 = local_pts[:2]
 
-        # 도로폭 계산
-        d1 = shortest_perpendicular_distance(corner1, center_lines)
-        d2 = shortest_perpendicular_distance(corner2, center_lines)
-        
-        if d1 is None or d2 is None:
-            continue
-        
-        w1 = round(d1 * 2, 3)
-        w2 = round(d2 * 2, 3)
+                # 1) 교차/접점 corner 찾기
+                corner_pt_local = intersect_or_touch(poly1_info["geom"], poly2_info["geom"])
+                if corner_pt_local is None: 
+                    continue
 
-        # 교차각 계산
-        dir1 = get_road_direction_from_intersection(intersection_pt, poly1_info["geom"])
-        dir2 = get_road_direction_from_intersection(intersection_pt, poly2_info["geom"])
-        
-        dir1_norm = dir1 / np.linalg.norm(dir1)
-        dir2_norm = dir2 / np.linalg.norm(dir2)
-        cos_angle = np.clip(np.dot(dir1_norm, dir2_norm), -1.0, 1.0)
-        intersection_angle = np.rad2deg(np.arccos(abs(cos_angle)))
-        
-        # 가각선 길이 결정 (개선된 로직)
-        corner_len = get_corner_length(intersection_angle, w1, w2)
-        
-        # 디버깅 정보 출력
-        st.info(f"📏 도로폭: w1={w1:.2f}m, w2={w2:.2f}m, 교차각: {intersection_angle:.1f}°")
-        
-        if not corner_len:
-            # 개선된 경험적 공식 (더 긴 가각선)
-            avg_width = (w1 + w2) / 2
-            
-            if intersection_angle < 60:
-                corner_len = max(avg_width * 1.5, 8.0)  # 최소 8m
-            elif intersection_angle < 75:
-                corner_len = max(avg_width * 1.2, 6.0)  # 최소 6m
-            elif intersection_angle > 120:
-                corner_len = max(avg_width * 2.0, 10.0)  # 최소 10m
-            elif intersection_angle > 105:
-                corner_len = max(avg_width * 1.5, 8.0)   # 최소 8m
-            else:  # 75-105도 (직각에 가까움)
-                corner_len = max(avg_width * 1.0, 5.0)   # 최소 5m
-            
-            st.info(f"📏 경험적 공식으로 가각선 길이 계산: {corner_len:.2f}m (기존 lookup_table에서 찾지 못함)")
-        else:
-            st.info(f"📏 lookup_table에서 가각선 길이: {corner_len:.2f}m")
-        
-        if corner_len <= 0:
-            st.warning(f"⚠️ 가각선 길이가 0 이하입니다: {corner_len}")
-            continue
+                st.info(f"🎯 계획선 교차/접점 발견: ({corner_pt_local.x:.2f}, {corner_pt_local.y:.2f})")
 
-        # 가각선 후보 생성 및 검증 (개선된 로직)
-        valid_corner_line = None
-        
-        for direction in [outward_bisector, inward_bisector]:
-            pt_array = np.array([intersection_pt.x, intersection_pt.y])
-            end_point_array = pt_array + direction * corner_len
-            
-            # 🎯 핵심 수정: 계산된 길이대로 직접 가각선 생성 (검증 과정 생략)
-            corner_line_candidate = LineString([
-                (pt_array[0], pt_array[1]),
-                (end_point_array[0], end_point_array[1])
-            ])
-            
-            # 길이 확인
-            candidate_length = Point(pt_array).distance(Point(end_point_array))
-            st.info(f"🔍 가각선 후보 길이: {candidate_length:.2f}m (목표: {corner_len:.2f}m)")
-            
-            if candidate_length > 1.0:  # 최소 1m 이상인 경우만 사용
-                valid_corner_line = corner_line_candidate
-                st.info(f"✅ 직접 생성한 가각선 채택: 길이 {candidate_length:.2f}m")
-                break
-            else:
-                st.warning(f"⚠️ 가각선 후보가 너무 짧음: {candidate_length:.2f}m")
-        
-        # 대안: 검증 기반 가각선 생성 (위 방법이 실패할 경우)
-        if not valid_corner_line:
-            st.info("🔄 검증 기반 가각선 생성 시도...")
-            
-            for direction in [outward_bisector, inward_bisector]:
-                pt_array = np.array([intersection_pt.x, intersection_pt.y])
-                end_point_array = pt_array + direction * corner_len
+                # 2) 도로폭·교차각→ L 구하기 (기존 로직 재사용)
+                d1 = shortest_perpendicular_distance(corner_pt_local, center_lines)
+                d2 = d1  # 사거리 기준이면 동일 축 가정. 필요시 두 축 분리계산
+                if d1 is None:
+                    continue
+                w1 = round(d1*2, 3); w2 = w1
                 
-                extension_length = 3.0
-                extended_start_array = pt_array - direction * extension_length
-                extended_end_array = end_point_array + direction * extension_length
+                # 두 계획선 접선으로 교차각 계산
+                s1 = project_param(poly1_info["geom"], corner_pt_local)
+                s2 = project_param(poly2_info["geom"], corner_pt_local)
+                a1 = unit_tangent_at(poly1_info["geom"], s1)
+                a2 = unit_tangent_at(poly2_info["geom"], s2)
+                cosang = np.clip(abs(np.dot(a1, a2)), -1.0, 1.0)
+                intersection_angle = np.degrees(np.arccos(cosang))
                 
-                extended_line = LineString([
-                    (extended_start_array[0], extended_start_array[1]),
-                    (extended_end_array[0], extended_end_array[1])
-                ])
+                st.info(f"📏 도로폭: w1={w1:.2f}m, w2={w2:.2f}m, 교차각: {intersection_angle:.1f}°")
                 
-                # 검증: 올바른 계획선과 교차하는지 확인
-                is_valid, intersection_points_final = validate_corner_line_candidate_optimized(
-                    extended_line, polylines, poly1_idx, poly2_idx
+                L = get_corner_length(intersection_angle, w1, w2)
+                if not L:
+                    # 경험식(직각기준)
+                    L = max(((w1+w2)/2)*1.0, 5.0)
+                    st.info(f"📏 경험적 공식으로 가각선 길이 계산: {L:.2f}m")
+                else:
+                    st.info(f"📏 lookup_table에서 가각선 길이: {L:.2f}m")
+
+                # 3) corner에서 양쪽 계획선으로 L만큼 '바깥'으로 이동해 P1,P2를 얻고, 가각선 구성
+                chamfer = build_chamfer_on_two_edges(
+                    poly1_info["geom"], poly2_info["geom"], corner_pt_local, L, center_lines
                 )
+                if chamfer is None: 
+                    st.warning(f"⚠️ 가각선 생성 실패: 너무 짧음")
+                    continue
+
+                # 실제 생성된 가각선 길이 계산
+                actual_length = Point(chamfer.coords[0]).distance(Point(chamfer.coords[1]))
+                st.info(f"🔍 실제 생성된 가각선 길이: {actual_length:.2f}m (목표: {L:.2f}m)")
+
+                # 4) 중복/유사 가각 제거
+                if is_duplicate_chamfer(chamfer, created_chamfers):
+                    st.info(f"🔄 중복 가각선 발견으로 건너뜀")
+                    continue
+                created_chamfers.append(chamfer)
+
+                # 5) DXF에 추가
+                (x1,y1),(x2,y2) = list(chamfer.coords)
+                ln = doc.modelspace().add_line((x1,y1),(x2,y2))
+                ln.dxf.layer = "가각선(안)"
+                corner_lines_added += 1
                 
-                if is_valid and len(intersection_points_final) == 2:
-                    # 교차점들 사이의 거리 확인
-                    validation_length = intersection_points_final[0].distance(intersection_points_final[1])
-                    st.info(f"🔍 검증된 가각선 길이: {validation_length:.2f}m")
-                    
-                    if validation_length > 1.0:  # 최소 1m 이상
-                        valid_corner_line = LineString([intersection_points_final[0], intersection_points_final[1]])
-                        st.info(f"✅ 검증 기반 가각선 채택: 길이 {validation_length:.2f}m")
-                        break
-                    else:
-                        st.warning(f"⚠️ 검증된 가각선이 너무 짧음: {validation_length:.2f}m")
-        
-        # 중복 검사 후 DXF 추가
-        if valid_corner_line:
-            if is_duplicate_chamfer(valid_corner_line, created_chamfers):
-                st.info(f"🔄 중복 가각선 발견으로 건너뜀: Center 교차점 ({center_pt.x:.2f}, {center_pt.y:.2f})")
-                continue
-            
-            created_chamfers.append(valid_corner_line)
-            corner_coords = list(valid_corner_line.coords)
-            
-            # 실제 생성된 가각선 길이 계산
-            actual_length = Point(corner_coords[0]).distance(Point(corner_coords[1]))
-            
-            # DXF에 가각선 추가
-            new_line = doc.modelspace().add_line(
-                (corner_coords[0][0], corner_coords[0][1]),
-                (corner_coords[1][0], corner_coords[1][1])
-            )
-            new_line.dxf.layer = "가각선(안)"
-            
-            corner_lines_added += 1
-            st.success(f"✅ 가각선 추가: Center 교차점 ({center_pt.x:.2f}, {center_pt.y:.2f}) 기준, 실제 길이: {actual_length:.2f}m")
-        else:
-            st.warning(f"⚠️ Center 교차점 ({center_pt.x:.2f}, {center_pt.y:.2f})에서 유효한 가각선을 생성할 수 없습니다.")
+                st.success(f"✅ 가각선 추가: 실제 길이 {actual_length:.2f}m")
 
     # 8단계: DXF 파일 저장
     current_step += 1
