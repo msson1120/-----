@@ -43,56 +43,76 @@ def cad_chamfer_equal_distance(poly1: LineString, poly2: LineString, corner_pt: 
     """
     CAD의 Equal Distance Chamfer - 두 선에서 동일한 거리로 모따기
     """
-    # 1) 교차점을 각 폴리라인에 사영
-    s1 = project_param(poly1, corner_pt)
-    s2 = project_param(poly2, corner_pt)
-    
-    # 2) 각 선에서 정확히 L만큼 떨어진 점 찾기 (양방향 시도)
-    def find_point_at_distance(poly: LineString, s_center: float, target_dist: float) -> Point:
-        # 앞뒤 양방향으로 target_dist만큼 떨어진 점 찾기
-        candidates = []
+    try:
+        # 1) 교차점을 각 폴리라인에 사영
+        s1 = project_param(poly1, corner_pt)
+        s2 = project_param(poly2, corner_pt)
         
-        # 방향 1: s_center에서 뒤쪽으로
-        s_back = s_center - target_dist
-        if s_back >= 0:
-            p_back = point_at_param(poly, s_back)
-            actual_dist = p_back.distance(corner_pt)
-            candidates.append((abs(actual_dist - target_dist), p_back))
+        st.info(f"🔧 CAD Chamfer 디버깅 - s1: {s1:.2f}, s2: {s2:.2f}")
         
-        # 방향 2: s_center에서 앞쪽으로  
-        s_forward = s_center + target_dist
-        if s_forward <= poly.length:
-            p_forward = point_at_param(poly, s_forward)
-            actual_dist = p_forward.distance(corner_pt)
-            candidates.append((abs(actual_dist - target_dist), p_forward))
+        # 2) 각 선에서 정확히 L만큼 떨어진 점 찾기 (양방향 시도)
+        def find_point_at_distance(poly: LineString, s_center: float, target_dist: float) -> Point:
+            try:
+                # 앞뒤 양방향으로 target_dist만큼 떨어진 점 찾기
+                candidates = []
+                
+                # 방향 1: s_center에서 뒤쪽으로
+                s_back = s_center - target_dist
+                if s_back >= 0:
+                    p_back = point_at_param(poly, s_back)
+                    actual_dist = p_back.distance(corner_pt)
+                    candidates.append((abs(actual_dist - target_dist), p_back))
+                
+                # 방향 2: s_center에서 앞쪽으로  
+                s_forward = s_center + target_dist
+                if s_forward <= poly.length:
+                    p_forward = point_at_param(poly, s_forward)
+                    actual_dist = p_forward.distance(corner_pt)
+                    candidates.append((abs(actual_dist - target_dist), p_forward))
+                
+                st.info(f"🔧 candidates 개수: {len(candidates)}")
+                
+                # 가장 목표 거리에 가까운 점 선택
+                if candidates:
+                    # 안전한 방식으로 최소값 찾기
+                    best_candidate = candidates[0]
+                    for candidate in candidates[1:]:
+                        if candidate[0] < best_candidate[0]:
+                            best_candidate = candidate
+                    return best_candidate[1]
+                else:
+                    # 실패시 끝점 사용
+                    return point_at_param(poly, max(0, min(poly.length, s_center + target_dist)))
+            except Exception as e:
+                st.error(f"❌ find_point_at_distance 오류: {e}")
+                return point_at_param(poly, s_center)
         
-        # 가장 목표 거리에 가까운 점 선택
-        if candidates:
-            return min(candidates)[1]
-        else:
-            # 실패시 끝점 사용
-            return point_at_param(poly, max(0, min(poly.length, s_center + target_dist)))
-    
-    # 3) 각 선에서 최적점 찾기
-    p1 = find_point_at_distance(poly1, s1, L)
-    p2 = find_point_at_distance(poly2, s2, L)
-    
-    # 4) 검증
-    d1_actual = p1.distance(corner_pt) 
-    d2_actual = p2.distance(corner_pt)
-    chamfer_length = p1.distance(p2)
-    
-    st.info(f"🎯 CAD Equal Distance Chamfer:")
-    st.info(f"   - 목표: {L:.2f}m × 2")
-    st.info(f"   - 실제: {d1_actual:.2f}m, {d2_actual:.2f}m") 
-    st.info(f"   - 가각선: {chamfer_length:.2f}m")
-    
-    # 너무 부정확하면 실패
-    if abs(d1_actual - L) > L * 0.5 or abs(d2_actual - L) > L * 0.5:
-        st.warning(f"⚠️ CAD Chamfer 품질 부족: 목표 거리와 차이가 큼")
+        # 3) 각 선에서 최적점 찾기
+        st.info(f"🔧 poly1에서 최적점 찾기...")
+        p1 = find_point_at_distance(poly1, s1, L)
+        st.info(f"🔧 poly2에서 최적점 찾기...")
+        p2 = find_point_at_distance(poly2, s2, L)
+        
+        # 4) 검증
+        d1_actual = p1.distance(corner_pt) 
+        d2_actual = p2.distance(corner_pt)
+        chamfer_length = p1.distance(p2)
+        
+        st.info(f"🎯 CAD Equal Distance Chamfer:")
+        st.info(f"   - 목표: {L:.2f}m × 2")
+        st.info(f"   - 실제: {d1_actual:.2f}m, {d2_actual:.2f}m") 
+        st.info(f"   - 가각선: {chamfer_length:.2f}m")
+        
+        # 너무 부정확하면 실패
+        if abs(d1_actual - L) > L * 0.5 or abs(d2_actual - L) > L * 0.5:
+            st.warning(f"⚠️ CAD Chamfer 품질 부족: 목표 거리와 차이가 큼")
+            return None
+            
+        return LineString([(p1.x, p1.y), (p2.x, p2.y)])
+        
+    except Exception as e:
+        st.error(f"❌ CAD Chamfer 전체 오류: {e}")
         return None
-        
-    return LineString([(p1.x, p1.y), (p2.x, p2.y)])
 
 def build_chamfer_on_two_edges(poly1: LineString, poly2: LineString, corner_pt: Point, L: float, center_lines) -> LineString:
     """
