@@ -151,7 +151,10 @@ def intersect_or_touch(poly1: LineString, poly2: LineString) -> Point:
     if poly1.intersects(poly2):
         inter = poly1.intersection(poly2)
         pts = extract_intersection_points(inter)
-        if pts: return min(pts, key=lambda q: q.distance(poly1.centroid))  # 임의 기준
+        if pts: 
+            # Point 객체 비교 오류 수정: 거리 기준으로 가장 가까운 점 선택
+            centroid = poly1.centroid
+            return min(pts, key=lambda q: q.distance(centroid))
     # 접함(거의 맞닿음) 처리
     d = poly1.distance(poly2)
     if d <= NEAR_TOL:
