@@ -39,21 +39,38 @@ def pick_outward_dir(base_pt: Point, unit_dir: np.ndarray, center_lines) -> np.n
     p_minus = Point(p0.x - OUT_STEP*unit_dir[0],  p0.y - OUT_STEP*unit_dir[1])
     return unit_dir if total_dist(p_plus) >= total_dist(p_minus) else -unit_dir
 
-def cad_chamfer_equal_distance(poly1: LineString, poly2: LineString, corner_pt: Point, L: float) -> LineString:
+def cad_chamfer_target_length(poly1: LineString, poly2: LineString, corner_pt: Point, target_chamfer_length: float) -> LineString:
     """
-    CAD의 Equal Distance Chamfer - 두 선에서 동일한 거리로 모따기
+    가각선 자체의 길이가 target_chamfer_length가 되도록 하는 CAD Chamfer
     """
     try:
         # 1) 교차점을 각 폴리라인에 사영
         s1 = project_param(poly1, corner_pt)
         s2 = project_param(poly2, corner_pt)
         
-        st.info(f"🔧 CAD Chamfer 디버깅 - s1: {s1:.2f}, s2: {s2:.2f}")
+        # 2) 교차각 계산
+        a1 = unit_tangent_at(poly1, s1)
+        a2 = unit_tangent_at(poly2, s2)
+        cosang = np.clip(abs(np.dot(a1, a2)), -1.0, 1.0)
+        intersection_angle_rad = np.arccos(cosang)
         
-        # 2) 각 선에서 정확히 L만큼 떨어진 점 찾기 (양방향 시도)
+        # 3) 목표 가각선 길이로부터 각 계획선에서의 거리 계산
+        # 가각선 길이 = 2 * L * sin(교차각/2) 에서 L을 역산
+        # L = 가각선길이 / (2 * sin(교차각/2))
+        half_angle = intersection_angle_rad / 2
+        if abs(np.sin(half_angle)) < 1e-6:  # 평행선인 경우
+            st.warning("⚠️ 거의 평행한 선분들 - 가각선 생성 불가")
+            return None
+            
+        L = target_chamfer_length / (2 * np.sin(half_angle))
+        
+        st.info(f"🔧 목표 가각선 길이: {target_chamfer_length:.2f}m")
+        st.info(f"🔧 교차각: {np.degrees(intersection_angle_rad):.1f}°")
+        st.info(f"🔧 계산된 각 계획선 거리: {L:.2f}m")
+        
+        # 4) 각 선에서 L만큼 떨어진 점 찾기
         def find_point_at_distance(poly: LineString, s_center: float, target_dist: float) -> Point:
             try:
-                # 앞뒤 양방향으로 target_dist만큼 떨어진 점 찾기
                 candidates = []
                 
                 # 방향 1: s_center에서 뒤쪽으로
@@ -70,48 +87,43 @@ def cad_chamfer_equal_distance(poly1: LineString, poly2: LineString, corner_pt: 
                     actual_dist = p_forward.distance(corner_pt)
                     candidates.append((abs(actual_dist - target_dist), p_forward))
                 
-                st.info(f"🔧 candidates 개수: {len(candidates)}")
-                
                 # 가장 목표 거리에 가까운 점 선택
                 if candidates:
-                    # 안전한 방식으로 최소값 찾기
                     best_candidate = candidates[0]
                     for candidate in candidates[1:]:
                         if candidate[0] < best_candidate[0]:
                             best_candidate = candidate
                     return best_candidate[1]
                 else:
-                    # 실패시 끝점 사용
                     return point_at_param(poly, max(0, min(poly.length, s_center + target_dist)))
             except Exception as e:
                 st.error(f"❌ find_point_at_distance 오류: {e}")
                 return point_at_param(poly, s_center)
         
-        # 3) 각 선에서 최적점 찾기
-        st.info(f"🔧 poly1에서 최적점 찾기...")
+        # 5) 각 선에서 최적점 찾기
         p1 = find_point_at_distance(poly1, s1, L)
-        st.info(f"🔧 poly2에서 최적점 찾기...")
         p2 = find_point_at_distance(poly2, s2, L)
         
-        # 4) 검증
+        # 6) 검증
         d1_actual = p1.distance(corner_pt) 
         d2_actual = p2.distance(corner_pt)
-        chamfer_length = p1.distance(p2)
+        actual_chamfer_length = p1.distance(p2)
         
-        st.info(f"🎯 CAD Equal Distance Chamfer:")
-        st.info(f"   - 목표: {L:.2f}m × 2")
-        st.info(f"   - 실제: {d1_actual:.2f}m, {d2_actual:.2f}m") 
-        st.info(f"   - 가각선: {chamfer_length:.2f}m")
+        st.info(f"🎯 Target Length Chamfer 결과:")
+        st.info(f"   - 목표 가각선 길이: {target_chamfer_length:.2f}m")
+        st.info(f"   - 실제 가각선 길이: {actual_chamfer_length:.2f}m") 
+        st.info(f"   - 각 계획선 거리: {d1_actual:.2f}m, {d2_actual:.2f}m")
         
-        # 너무 부정확하면 실패
-        if abs(d1_actual - L) > L * 0.5 or abs(d2_actual - L) > L * 0.5:
-            st.warning(f"⚠️ CAD Chamfer 품질 부족: 목표 거리와 차이가 큼")
+        # 가각선 길이 검증 (±15% 허용)
+        length_error = abs(actual_chamfer_length - target_chamfer_length) / target_chamfer_length
+        if length_error > 0.15:  # 15% 이상 오차시 실패
+            st.warning(f"⚠️ 가각선 길이 오차가 큼: {length_error*100:.1f}%")
             return None
             
         return LineString([(p1.x, p1.y), (p2.x, p2.y)])
         
     except Exception as e:
-        st.error(f"❌ CAD Chamfer 전체 오류: {e}")
+        st.error(f"❌ Target Length Chamfer 오류: {e}")
         return None
 
 def build_chamfer_on_two_edges(poly1: LineString, poly2: LineString, corner_pt: Point, L: float, center_lines) -> LineString:
@@ -751,16 +763,16 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
                 else:
                     st.info(f"📏 lookup_table에서 가각선 길이: {L:.2f}m")
 
-                # 3) corner에서 양쪽 계획선으로 L만큼 '바깥'으로 이동해 P1,P2를 얻고, 가각선 구성
-                # 먼저 CAD 방식 시도
-                st.info(f"🎯 가각선 생성 시도: 교차점 ({corner_pt_local.x:.2f}, {corner_pt_local.y:.2f})")
+                # 3) corner에서 양쪽 계획선으로 가각선 구성
+                # 새로운 방식: 가각선 자체 길이가 L이 되도록
+                st.info(f"🎯 가각선 생성 시도: 목표 가각선 길이 {L:.2f}m")
                 
-                chamfer = cad_chamfer_equal_distance(poly1_info["geom"], poly2_info["geom"], corner_pt_local, L)
+                chamfer = cad_chamfer_target_length(poly1_info["geom"], poly2_info["geom"], corner_pt_local, L)
                 
                 if chamfer is not None:
-                    st.success(f"✅ CAD방식 가각선 생성 성공!")
+                    st.success(f"✅ Target Length 방식 가각선 생성 성공!")
                 else:
-                    st.warning(f"⚠️ CAD방식 실패, 기존방식 시도...")
+                    st.warning(f"⚠️ Target Length 방식 실패, 기존방식 시도...")
                     # 기존 방식으로 대체
                     chamfer = build_chamfer_on_two_edges(
                         poly1_info["geom"], poly2_info["geom"], corner_pt_local, L, center_lines
