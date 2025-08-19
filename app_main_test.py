@@ -101,14 +101,14 @@ def cad_chamfer_target_length(poly1: LineString, poly2: LineString, corner_pt: P
         s1 = project_param(poly1, corner_pt)
         s2 = project_param(poly2, corner_pt)
         
-        # 2) 기하학적 계산용 교차각 (예각만 사용)
+        # 2) 실제 교차각 계산 (둔각도 그대로 사용!)
         a1 = unit_tangent_at(poly1, s1)
         a2 = unit_tangent_at(poly2, s2)
         
-        # 내적으로 코사인 값 계산
+        # 내적으로 코사인 값 계산 (abs() 제거!)
         dot_product = np.dot(a1, a2)
-        cosang = np.clip(abs(dot_product), 0.0, 1.0)  # 절댓값으로 예각만 추출
-        intersection_angle_rad = np.arccos(cosang)  # 0~π/2 범위 (0~90°)
+        cosang = np.clip(dot_product, -1.0, 1.0)  # -1~1 범위로 제한
+        intersection_angle_rad = np.arccos(cosang)  # 0~π 범위의 실제 교차각
         
         # 3) 목표 가각선 길이로부터 각 계획선에서의 거리 계산
         # 가각선 길이 = 2 * L * sin(교차각/2) 에서 L을 역산
@@ -121,7 +121,7 @@ def cad_chamfer_target_length(poly1: LineString, poly2: LineString, corner_pt: P
         L = target_chamfer_length / (2 * np.sin(half_angle))
         
         st.info(f"🔧 목표 가각선 길이: {target_chamfer_length:.2f}m")
-        st.info(f"🔧 기하학적 계산 각도: {np.degrees(intersection_angle_rad):.1f}°")
+        st.info(f"🔧 실제 교차각: {np.degrees(intersection_angle_rad):.1f}°")
         st.info(f"🔧 계산된 각 계획선 거리: {L:.2f}m")
         
         # 4) 각 선에서 L만큼 떨어진 점 찾기
