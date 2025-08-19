@@ -23,12 +23,65 @@ def point_at_param(ls: LineString, s: float) -> Point:
     return ls.interpolate(max(0.0, min(s, ls.length)))
 
 def unit_tangent_at(ls: LineString, s: float) -> np.ndarray:
-    """ls의 길이좌표 s에서의 접선 단위벡터(방향성 유지)"""
-    s0 = max(0.0, s - EPS); s1 = min(ls.length, s + EPS)
-    p0 = point_at_param(ls, s0); p1 = point_at_param(ls, s1)
+    """ls의 길이좌표 s에서의 접선 단위벡터(방향성 유지) - 곡선 폴리라인 개선"""
+    
+    # 경계값 처리
+    s = max(0.0, min(s, ls.length))
+    
+    # 적응적 EPS 계산 (폴리라인 길이에 비례)
+    adaptive_eps = min(EPS, ls.length * 0.01)  # 폴리라인 길이의 1% 또는 EPS 중 작은 값
+    
+    # 전진/후진 좌표 계산
+    s0 = max(0.0, s - adaptive_eps)
+    s1 = min(ls.length, s + adaptive_eps)
+    
+    # s0과 s1이 너무 가까우면 범위 확장
+    if abs(s1 - s0) < 1e-6:
+        if s < ls.length / 2:
+            s0 = max(0.0, s - ls.length * 0.05)
+            s1 = min(ls.length, s + ls.length * 0.05)
+        else:
+            s0 = max(0.0, s - ls.length * 0.05)
+            s1 = min(ls.length, s + ls.length * 0.05)
+    
+    # 점 계산
+    p0 = point_at_param(ls, s0)
+    p1 = point_at_param(ls, s1)
+    
+    # 벡터 계산
     v = np.array([p1.x - p0.x, p1.y - p0.y])
     n = np.linalg.norm(v)
-    return v / n if n > 1e-9 else np.array([1.0, 0.0])
+    
+    # 정규화
+    if n > 1e-9:
+        return v / n
+    else:
+        # 백업: 폴리라인의 좌표점들 직접 사용
+        coords = list(ls.coords)
+        if len(coords) >= 2:
+            # 가장 가까운 세그먼트 찾기
+            current_pt = point_at_param(ls, s)
+            min_dist = float('inf')
+            best_seg_idx = 0
+            
+            for i in range(len(coords) - 1):
+                seg_start = Point(coords[i])
+                seg_end = Point(coords[i + 1])
+                dist = current_pt.distance(seg_start) + current_pt.distance(seg_end)
+                if dist < min_dist:
+                    min_dist = dist
+                    best_seg_idx = i
+            
+            # 해당 세그먼트의 방향 벡터
+            dx = coords[best_seg_idx + 1][0] - coords[best_seg_idx][0]
+            dy = coords[best_seg_idx + 1][1] - coords[best_seg_idx][1]
+            seg_length = np.sqrt(dx*dx + dy*dy)
+            
+            if seg_length > 1e-9:
+                return np.array([dx/seg_length, dy/seg_length])
+        
+        # 최종 백업
+        return np.array([1.0, 0.0])
 
 def pick_outward_dir(base_pt: Point, unit_dir: np.ndarray, center_lines) -> np.ndarray:
     """unit_dir(±) 중, center까지의 총거리가 증가하는 방향을 '바깥'으로 선택"""
@@ -48,11 +101,14 @@ def cad_chamfer_target_length(poly1: LineString, poly2: LineString, corner_pt: P
         s1 = project_param(poly1, corner_pt)
         s2 = project_param(poly2, corner_pt)
         
-        # 2) 교차각 계산
+        # 2) 기하학적 계산용 교차각 (예각만 사용)
         a1 = unit_tangent_at(poly1, s1)
         a2 = unit_tangent_at(poly2, s2)
-        cosang = np.clip(abs(np.dot(a1, a2)), -1.0, 1.0)
-        intersection_angle_rad = np.arccos(cosang)
+        
+        # 내적으로 코사인 값 계산
+        dot_product = np.dot(a1, a2)
+        cosang = np.clip(abs(dot_product), 0.0, 1.0)  # 절댓값으로 예각만 추출
+        intersection_angle_rad = np.arccos(cosang)  # 0~π/2 범위 (0~90°)
         
         # 3) 목표 가각선 길이로부터 각 계획선에서의 거리 계산
         # 가각선 길이 = 2 * L * sin(교차각/2) 에서 L을 역산
@@ -65,7 +121,7 @@ def cad_chamfer_target_length(poly1: LineString, poly2: LineString, corner_pt: P
         L = target_chamfer_length / (2 * np.sin(half_angle))
         
         st.info(f"🔧 목표 가각선 길이: {target_chamfer_length:.2f}m")
-        st.info(f"🔧 교차각: {np.degrees(intersection_angle_rad):.1f}°")
+        st.info(f"🔧 기하학적 계산 각도: {np.degrees(intersection_angle_rad):.1f}°")
         st.info(f"🔧 계산된 각 계획선 거리: {L:.2f}m")
         
         # 4) 각 선에서 L만큼 떨어진 점 찾기
@@ -745,13 +801,17 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
                     continue
                 w1 = round(d1*2, 3); w2 = w1
                 
-                # 두 계획선 접선으로 교차각 계산
+                # 두 계획선 접선으로 교차각 계산 (실제 교차각 그대로 사용)
                 s1 = project_param(poly1_info["geom"], corner_pt_local)
                 s2 = project_param(poly2_info["geom"], corner_pt_local)
                 a1 = unit_tangent_at(poly1_info["geom"], s1)
                 a2 = unit_tangent_at(poly2_info["geom"], s2)
-                cosang = np.clip(abs(np.dot(a1, a2)), -1.0, 1.0)
-                intersection_angle = np.degrees(np.arccos(cosang))
+                
+                # 내적으로 코사인 값 계산
+                dot_product = np.dot(a1, a2)
+                cosang = np.clip(dot_product, -1.0, 1.0)  # -1~1 범위로 제한
+                intersection_angle_rad = np.arccos(cosang)  # 0~π 범위의 실제 교차각
+                intersection_angle = np.degrees(intersection_angle_rad)  # 0~180° 범위
                 
                 st.info(f"📏 도로폭: w1={w1:.2f}m, w2={w2:.2f}m, 교차각: {intersection_angle:.1f}°")
                 
