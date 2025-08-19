@@ -22,65 +22,77 @@ def project_param(ls: LineString, p: Point) -> float:
 def point_at_param(ls: LineString, s: float) -> Point:
     return ls.interpolate(max(0.0, min(s, ls.length)))
 
-def unit_tangent_at(ls: LineString, s: float) -> np.ndarray:
-    """ls의 길이좌표 s에서의 접선 단위벡터(방향성 유지) - 곡선 폴리라인 개선"""
-    
-    # 경계값 처리
-    s = max(0.0, min(s, ls.length))
-    
-    # 적응적 EPS 계산 (폴리라인 길이에 비례)
-    adaptive_eps = min(EPS, ls.length * 0.01)  # 폴리라인 길이의 1% 또는 EPS 중 작은 값
-    
-    # 전진/후진 좌표 계산
-    s0 = max(0.0, s - adaptive_eps)
-    s1 = min(ls.length, s + adaptive_eps)
-    
-    # s0과 s1이 너무 가까우면 범위 확장
-    if abs(s1 - s0) < 1e-6:
-        if s < ls.length / 2:
-            s0 = max(0.0, s - ls.length * 0.05)
-            s1 = min(ls.length, s + ls.length * 0.05)
-        else:
-            s0 = max(0.0, s - ls.length * 0.05)
-            s1 = min(ls.length, s + ls.length * 0.05)
-    
-    # 점 계산
-    p0 = point_at_param(ls, s0)
-    p1 = point_at_param(ls, s1)
-    
-    # 벡터 계산
-    v = np.array([p1.x - p0.x, p1.y - p0.y])
-    n = np.linalg.norm(v)
-    
-    # 정규화
-    if n > 1e-9:
-        return v / n
-    else:
-        # 백업: 폴리라인의 좌표점들 직접 사용
-        coords = list(ls.coords)
-        if len(coords) >= 2:
-            # 가장 가까운 세그먼트 찾기
-            current_pt = point_at_param(ls, s)
-            min_dist = float('inf')
-            best_seg_idx = 0
-            
-            for i in range(len(coords) - 1):
-                seg_start = Point(coords[i])
-                seg_end = Point(coords[i + 1])
-                dist = current_pt.distance(seg_start) + current_pt.distance(seg_end)
-                if dist < min_dist:
-                    min_dist = dist
-                    best_seg_idx = i
-            
-            # 해당 세그먼트의 방향 벡터
-            dx = coords[best_seg_idx + 1][0] - coords[best_seg_idx][0]
-            dy = coords[best_seg_idx + 1][1] - coords[best_seg_idx][1]
-            seg_length = np.sqrt(dx*dx + dy*dy)
-            
-            if seg_length > 1e-9:
-                return np.array([dx/seg_length, dy/seg_length])
+def unit_tangent_at(entity, point, min_segment_length=1.0):
+    """엔티티에서 지정된 점에서의 단위 접선 벡터를 구함 (개선된 버전)"""
+    try:
+        if hasattr(entity, 'dxftype') and entity.dxftype() == 'LINE':
+            # 직선의 경우
+            start = np.array([entity.dxf.start.x, entity.dxf.start.y])
+            end = np.array([entity.dxf.end.x, entity.dxf.end.y])
+            direction = end - start
+            return direction / np.linalg.norm(direction)
         
-        # 최종 백업
+        elif hasattr(entity, 'dxftype') and entity.dxftype() in ['LWPOLYLINE', 'POLYLINE']:
+            # 폴리라인의 경우 - 개선된 접선 계산
+            points = []
+            if hasattr(entity, 'vertices'):
+                points = [(v.dxf.location.x, v.dxf.location.y) for v in entity.vertices]
+            elif hasattr(entity, 'get_points'):
+                points = [(p[0], p[1]) for p in entity.get_points()]
+            
+            if len(points) < 2:
+                return np.array([1.0, 0.0])
+            
+            # 가장 가까운 세그먼트 찾기
+            target_point = np.array([point.x, point.y])
+            min_dist = float('inf')
+            best_segment_idx = 0
+            
+            for i in range(len(points) - 1):
+                p1 = np.array(points[i])
+                p2 = np.array(points[i + 1])
+                
+                # 🔧 예각 처리: 세그먼트 길이가 너무 짧은 경우 다음 세그먼트와 결합
+                segment_length = np.linalg.norm(p2 - p1)
+                if segment_length < min_segment_length and i + 2 < len(points):
+                    # 다음 세그먼트와 결합하여 더 긴 방향벡터 사용
+                    p2 = np.array(points[i + 2])
+                
+                # 점과 세그먼트 사이의 거리 계산
+                line_vec = p2 - p1
+                if np.linalg.norm(line_vec) > 0:
+                    point_vec = target_point - p1
+                    projection = np.dot(point_vec, line_vec) / np.dot(line_vec, line_vec)
+                    projection = np.clip(projection, 0, 1)
+                    closest_point = p1 + projection * line_vec
+                    dist = np.linalg.norm(target_point - closest_point)
+                    
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_segment_idx = i
+            
+            # 최적 세그먼트의 방향벡터 계산
+            p1 = np.array(points[best_segment_idx])
+            p2 = np.array(points[best_segment_idx + 1])
+            
+            # 🔧 세그먼트가 너무 짧으면 확장된 방향벡터 사용
+            segment_length = np.linalg.norm(p2 - p1)
+            if segment_length < min_segment_length and best_segment_idx + 2 < len(points):
+                p2 = np.array(points[best_segment_idx + 2])
+            
+            direction = p2 - p1
+            length = np.linalg.norm(direction)
+            if length > 0:
+                return direction / length
+            else:
+                return np.array([1.0, 0.0])
+        
+        else:
+            # 기타 엔티티는 기본값 반환
+            return np.array([1.0, 0.0])
+            
+    except Exception as e:
+        print(f"Warning: unit_tangent_at 계산 실패: {e}")
         return np.array([1.0, 0.0])
 
 def pick_outward_dir(base_pt: Point, unit_dir: np.ndarray, center_lines) -> np.ndarray:
@@ -279,7 +291,13 @@ def load_lookup_table():
         return False
 
 # 기준표 설정
-angle_classes = {"60°전후": (45, 75), "90°전후": (75, 105), "120°전후": (105, 135)}
+angle_classes = {
+    "30°전후": (15, 45),      # 예각 추가
+    "60°전후": (45, 75), 
+    "90°전후": (75, 105), 
+    "120°전후": (105, 135),
+    "150°전후": (135, 165)    # 둔각 확장
+}
 width_classes = [
     "6m이상8m미만", "8m이상10m미만", "10m이상12m미만", "12m이상15m미만",
     "15m이상20m미만", "20m이상25m미만", "25m이상30m미만", "30m이상35m미만",
@@ -813,15 +831,37 @@ def process_dxf_file(uploaded_file, progress_bar=None, status_text=None):
                 intersection_angle_rad = np.arccos(cosang)  # 0~π 범위의 실제 교차각
                 intersection_angle = np.degrees(intersection_angle_rad)  # 0~180° 범위
                 
+                # 🔧 예각 보정: 너무 작은 각도는 보정
+                if intersection_angle < 15:
+                    st.warning(f"⚠️ 매우 예각인 교차각({intersection_angle:.1f}°) 감지 - 30°로 보정")
+                    intersection_angle = 30.0
+                elif intersection_angle > 165:
+                    st.warning(f"⚠️ 매우 둔각인 교차각({intersection_angle:.1f}°) 감지 - 150°로 보정")
+                    intersection_angle = 150.0
+                
                 st.info(f"📏 도로폭: w1={w1:.2f}m, w2={w2:.2f}m, 교차각: {intersection_angle:.1f}°")
                 
-                L = get_corner_length(intersection_angle, w1, w2)
+                # 🔧 예각 보정: 룩업 테이블 조회에 사용할 보정된 각도
+                lookup_angle = intersection_angle
+                empirical_factor = 1.0
+                is_acute = intersection_angle <= 45
+                
+                if is_acute:
+                    # 예각일수록 가각선이 길어지는 경향 반영
+                    empirical_factor = 1.2 + (45 - intersection_angle) / 100.0  # 예각 보정 계수
+                    st.info(f"🔧 예각 보정 계수: {empirical_factor:.2f}")
+                
+                L = get_corner_length(lookup_angle, w1, w2)
                 if not L:
-                    # 경험식(직각기준)
-                    L = max(((w1+w2)/2)*1.0, 5.0)
+                    # 🔧 예각 대비 경험적 공식 개선
+                    if is_acute:
+                        L = max(((w1+w2)/2)*1.2, 8.0) * empirical_factor
+                    else:
+                        L = max(((w1+w2)/2)*1.0, 5.0)
                     st.info(f"📏 경험적 공식으로 가각선 길이 계산: {L:.2f}m")
                 else:
-                    st.info(f"📏 lookup_table에서 가각선 길이: {L:.2f}m")
+                    L = L * empirical_factor  # 룩업 값에도 보정 계수 적용
+                    st.info(f"📏 lookup_table에서 가각선 길이: {L:.2f}m (보정 적용)")
 
                 # 3) corner에서 양쪽 계획선으로 가각선 구성
                 # 새로운 방식: 가각선 자체 길이가 L이 되도록
